@@ -177,13 +177,10 @@ fn game_major(version: &str) -> Option<u32> {
 impl Mod {
     /// The newest file that suits `target` and the allowed release channel.
     pub fn best_file(&self, target: GameTarget, channel: ReleaseType) -> Option<&FileIndex> {
-        let suitable = self.latest_files_indexes.iter().filter(|i| {
-            i.release_type <= channel
-                && match target {
-                    GameTarget::Major(m) => game_major(&i.game_version) == Some(m),
-                    GameTarget::Newest | GameTarget::Any => true,
-                }
-        });
+        let suitable = self
+            .latest_files_indexes
+            .iter()
+            .filter(|i| i.release_type <= channel && target.accepts(&i.game_version));
         match target {
             GameTarget::Newest => suitable.max_by_key(|i| (game_major(&i.game_version), i.file_id)),
             _ => suitable.max_by_key(|i| i.file_id),
@@ -456,6 +453,19 @@ mod tests {
         assert_eq!(pick(GameTarget::Major(5), Release), None);
         assert_eq!(pick(GameTarget::Any, Release), Some(500));
         assert_eq!(pick(GameTarget::Newest, Release), Some(300));
+    }
+
+    #[test]
+    fn forever_and_classic_era_files_are_not_mixed_up() {
+        use ReleaseType::*;
+        let m = mod_with(vec![
+            index("1.15.4", 350, Release),
+            index("1.60.1", 600, Release),
+            index("1.15.5", 900, Release),
+        ]);
+        let pick = |t| m.best_file(t, Release).map(|i| i.file_id);
+        assert_eq!(pick(GameTarget::Forever), Some(600));
+        assert_eq!(pick(GameTarget::ClassicEra), Some(900));
     }
 
     #[test]

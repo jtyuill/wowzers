@@ -30,9 +30,8 @@ impl FlavorInstall {
     pub fn target(&self) -> GameTarget {
         self.version
             .as_deref()
-            .and_then(|v| v.split('.').next())
-            .and_then(|major| major.parse().ok())
-            .map_or_else(|| self.flavor.fallback_target(), GameTarget::Major)
+            .and_then(GameTarget::from_client_version)
+            .unwrap_or_else(|| self.flavor.fallback_target())
     }
 }
 
@@ -192,11 +191,12 @@ pub fn candidate_roots() -> Vec<PathBuf> {
 
     #[cfg(target_os = "linux")]
     if let Some(home) = dirs::home_dir() {
-        // Wine prefixes: plain Wine, Lutris, Heroic, Bottles (native and
+        // Wine prefixes: plain Wine, Lutris, Faugus, Heroic, Bottles (native and
         // Flatpak) and Steam's Proton prefixes for Battle.net.
         let mut prefixes: Vec<PathBuf> = vec![home.join(".wine")];
         let prefix_parents = [
             home.join("Games"),
+            home.join("Faugus"), // Faugus Launcher
             home.join("Games/Heroic/Prefixes"),
             home.join("Games/Heroic/Prefixes/default"),
             home.join(".local/share/bottles/bottles"),
@@ -258,13 +258,37 @@ mod tests {
             [Flavor::Retail, Flavor::Classic, Flavor::ClassicEra]
         );
         assert_eq!(install.flavors[0].target(), GameTarget::Major(11));
-        assert_eq!(install.flavors[2].target(), GameTarget::Major(1));
+        assert_eq!(install.flavors[2].target(), GameTarget::ClassicEra);
         // No build info row for `wow_classic`: unknown, not guessed.
         assert_eq!(install.flavors[1].target(), GameTarget::Any);
         assert_eq!(
             install.flavors[0].addons_dir,
             tmp.path().join("_retail_/Interface/AddOns")
         );
+    }
+
+    #[test]
+    fn forever_is_detected_from_its_folder_and_product() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".build.info"),
+            "Branch!STRING:0|Version!STRING:0|Product!STRING:0\nus|1.60.1.70790|wowf\n",
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("_forever_")).unwrap();
+        let install = inspect_root(tmp.path()).unwrap();
+        let forever = &install.flavors[0];
+        assert_eq!(forever.flavor, Flavor::Forever);
+        assert_eq!(forever.version.as_deref(), Some("1.60.1.70790"));
+        assert_eq!(forever.target(), GameTarget::Forever);
+        assert_eq!(
+            forever.addons_dir,
+            tmp.path().join("_forever_/Interface/AddOns")
+        );
+        // Without .build.info the folder name alone still picks the target.
+        std::fs::remove_file(tmp.path().join(".build.info")).unwrap();
+        let install = inspect_root(tmp.path()).unwrap();
+        assert_eq!(install.flavors[0].target(), GameTarget::Forever);
     }
 
     #[test]

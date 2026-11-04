@@ -2,8 +2,8 @@
 
 A World of Warcraft addon manager written in Rust with [GPUI](https://gpui.rs). It wraps the [CurseForge API](https://docs.curseforge.com/rest-api) and does four things:
 
-- **Finds your WoW install**: Wine prefixes (plain Wine, Lutris, Heroic, Bottles, Proton), `/Applications` on macOS, Program Files on Windows, or any folder you pick.
-- **Lists the addons in each client flavor** (Retail, Classic, Classic Era, PTR, ...), grouping multi-folder addons.
+- **Finds your WoW install**: Wine prefixes (plain Wine, Lutris, Faugus, Heroic, Bottles, Proton), `/Applications` on macOS, Program Files on Windows, or any folder you pick.
+- **Lists the addons in each client flavor** (Retail, Classic, Classic Era, WoW Forever, PTR, ...), grouping multi-folder addons.
 - **Installs, removes and searches** CurseForge addons.
 - **Updates everything with one click** (*Update all*).
 
