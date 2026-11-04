@@ -1,5 +1,5 @@
 //! Core of wowzers: find WoW installs, read the addons in them, and keep
-//! those addons current through the CurseForge API. No UI here.
+//! those addons current via the CurseForge website. No UI here.
 
 pub mod config;
 pub mod curseforge;

@@ -1,4 +1,4 @@
-//! wowzers: a World of Warcraft addon manager over the CurseForge API.
+//! wowzers: a World of Warcraft addon manager backed by the CurseForge site.
 
 mod app;
 mod format;

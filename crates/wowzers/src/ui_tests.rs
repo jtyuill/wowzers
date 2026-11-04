@@ -10,9 +10,7 @@ use gpui_kit::{
 };
 use wowzers_core::{
     manager::UpdateStatus,
-    testing::{
-        Server, blobs, file_json, index, mod_json, serve, sha1_hex, wow_with_addons, zip_bytes,
-    },
+    testing::{FakeFile, FakeProject, Server, serve, wow_with_addons, zip_bytes},
 };
 
 use crate::app::{Options, SearchState, Tab, Wowzers};
@@ -49,24 +47,23 @@ impl Harness {
             ("Gamma/Gamma.toc", "## Title: Gamma\n"),
             ("Gamma/new.lua", "new"),
         ]);
-        let server = serve(
-            vec![
-                mod_json(100, "Alpha", vec![index("11.0.2", 1002, 1)]),
-                mod_json(200, "Beta", vec![index("11.0.2", 2002, 1)]),
-                mod_json(300, "Gamma Search", vec![index("11.0.2", 3002, 1)]),
-            ],
-            vec![
-                file_json(1002, 100, "Alpha-2.0", "/dl/a.zip", &sha1_hex(&alpha)),
-                file_json(2002, 200, "Beta-1.0", "/dl/b.zip", &sha1_hex(&beta)),
-                file_json(3002, 300, "Gamma-3.0", "/dl/g.zip", &sha1_hex(&gamma)),
-            ],
-            blobs(&[
-                ("/dl/a.zip", &alpha),
-                ("/dl/b.zip", &beta),
-                ("/dl/g.zip", &gamma),
-            ]),
-            "KEY",
-        );
+        let server = serve(vec![
+            FakeProject::new(
+                100,
+                "Alpha",
+                vec![FakeFile::new(1002, "Alpha-2.0", &["11.0.2"]).with_blob(alpha)],
+            ),
+            FakeProject::new(
+                200,
+                "Beta",
+                vec![FakeFile::new(2002, "Beta-1.0", &["11.0.2"]).with_blob(beta)],
+            ),
+            FakeProject::new(
+                300,
+                "Gamma Search",
+                vec![FakeFile::new(3002, "Gamma-3.0", &["11.0.2"]).with_blob(gamma)],
+            ),
+        ]);
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("World of Warcraft");
@@ -88,13 +85,13 @@ impl Harness {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(
             &config_path,
-            serde_json::json!({ "api_key": "KEY", "wow_roots": [root] }).to_string(),
+            serde_json::json!({ "wow_roots": [root] }).to_string(),
         )
         .unwrap();
 
         let options = Options {
             config_path: Some(config_path),
-            api_base: Some(server.base.clone()),
+            base_url: Some(server.base.clone()),
             scan_default_locations: false,
         };
         let (window, view) = cx.update(|cx| {

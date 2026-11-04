@@ -25,8 +25,6 @@ use crate::{
     format::{compact_count, truncate},
 };
 
-const CURSEFORGE_KEYS_URL: &str = "https://console.curseforge.com/#/api-keys";
-
 impl Render for Wowzers {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -45,9 +43,6 @@ impl Render for Wowzers {
                         .text_sm()
                         .child(error),
                 )
-            })
-            .when(!self.has_api_key() && self.tab != Tab::Settings, |this| {
-                this.child(self.key_banner(cx))
             })
             .child(match self.tab {
                 Tab::Installed => self.installed_tab(cx),
@@ -116,32 +111,6 @@ impl Wowzers {
             .into_any_element()
     }
 
-    fn key_banner(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        h_flex()
-            .px_4()
-            .py_2()
-            .gap_3()
-            .items_center()
-            .bg(theme.warning.opacity(0.15))
-            .text_sm()
-            .child(
-                div().flex_1().child(
-                    "wowzers needs a free CurseForge API key to look up and download addons.",
-                ),
-            )
-            .child(
-                Button::new("banner-key")
-                    .small()
-                    .label("Add key")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.tab = Tab::Settings;
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-
     // ---- installed ----------------------------------------------------
 
     fn installed_tab(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -188,7 +157,7 @@ impl Wowzers {
                     .icon(IconName::RefreshCw)
                     .label("Check for updates")
                     .loading(checking)
-                    .disabled(!idle || !self.has_api_key())
+                    .disabled(!idle)
                     .on_click(cx.listener(|this, _, window, cx| this.check(window, cx))),
             )
             .child(
@@ -337,9 +306,6 @@ impl Wowzers {
             (Some(UpdateStatus::UpToDate), _) => Tag::success().small().child("Up to date"),
             (Some(UpdateStatus::NoCompatibleFile), _) => {
                 Tag::secondary().small().child(format!("No {flavor} file"))
-            }
-            (Some(UpdateStatus::NotDownloadable), _) => {
-                Tag::secondary().small().child("Manual download only")
             }
             (Some(UpdateStatus::NotFound), _) => {
                 Tag::secondary().small().child("Not on CurseForge")
@@ -519,19 +485,6 @@ impl Wowzers {
                 .child(text)
         };
 
-        let key_hint = if self
-            .config
-            .api_key
-            .as_deref()
-            .is_some_and(|k| !k.trim().is_empty())
-        {
-            "A key is saved. Enter a new one to replace it."
-        } else if self.has_api_key() {
-            "Using the key from the CURSEFORGE_API_KEY environment variable."
-        } else {
-            "No key yet."
-        };
-
         let installs: Vec<AnyElement> = self
             .installs
             .iter()
@@ -583,31 +536,6 @@ impl Wowzers {
             .p_4()
             .gap_6()
             .max_w(px(760.))
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(heading("CurseForge API key"))
-                    .child(hint(format!(
-                        "{key_hint} Keys are free at console.curseforge.com and stay on this computer."
-                    )))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().flex_1().child(Input::new(&self.key_input)))
-                            .child(
-                                Button::new("save-key")
-                                    .primary()
-                                    .label("Save")
-                                    .on_click(cx.listener(|this, _, window, cx| this.save_api_key(window, cx))),
-                            )
-                            .child(
-                                Button::new("get-key")
-                                    .outline()
-                                    .label("Get a key")
-                                    .on_click(cx.listener(|_, _, _, cx| cx.open_url(CURSEFORGE_KEYS_URL))),
-                            ),
-                    ),
-            )
             .child(
                 v_flex()
                     .gap_2()

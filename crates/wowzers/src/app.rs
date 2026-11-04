@@ -31,8 +31,8 @@ const BASE_URL_ENV: &str = "WOWZERS_CURSEFORGE_URL";
 /// Where the app reads its settings and which servers and folders it uses.
 pub struct Options {
     pub config_path: Option<PathBuf>,
-    /// CurseForge base URL; `None` for the real API.
-    pub api_base: Option<String>,
+    /// CurseForge site URL; `None` for the real site.
+    pub base_url: Option<String>,
     /// Look for WoW in the usual install locations, not only saved paths.
     pub scan_default_locations: bool,
 }
@@ -41,7 +41,7 @@ impl Options {
     pub fn from_env() -> Self {
         Options {
             config_path: Config::default_path(),
-            api_base: std::env::var(BASE_URL_ENV).ok().filter(|u| !u.is_empty()),
+            base_url: std::env::var(BASE_URL_ENV).ok().filter(|u| !u.is_empty()),
             scan_default_locations: true,
         }
     }
@@ -85,7 +85,6 @@ pub struct Wowzers {
     pub search_input: Entity<InputState>,
     pub search_results: Vec<Mod>,
     pub search_state: SearchState,
-    pub key_input: Entity<InputState>,
     pub path_input: Entity<InputState>,
     /// Folder name of the addon whose Remove button awaits confirmation.
     pub confirm_remove: Option<String>,
@@ -105,11 +104,6 @@ impl Wowzers {
 
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search CurseForge addons"));
-        let key_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("CurseForge API key")
-                .masked(true)
-        });
         let path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/World of Warcraft"));
         let subscriptions = vec![
@@ -119,15 +113,6 @@ impl Wowzers {
                 |this, _, event: &InputEvent, window, cx| {
                     if let InputEvent::PressEnter { .. } = event {
                         this.search(window, cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
-                &key_input,
-                window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        this.save_api_key(window, cx);
                     }
                 },
             ),
@@ -156,7 +141,6 @@ impl Wowzers {
             search_input,
             search_results: Vec::new(),
             search_state: SearchState::Idle,
-            key_input,
             path_input,
             confirm_remove: None,
             error: config_error.map(Into::into),
@@ -298,22 +282,6 @@ impl Wowzers {
         }
     }
 
-    pub fn save_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self.key_input.read(cx).value().trim().to_string();
-        if key.is_empty() {
-            return;
-        }
-        self.config.api_key = Some(key);
-        self.save_config();
-        self.key_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.notify(NotificationType::Success, "API key saved", window, cx);
-        if self.current_flavor().is_some() {
-            self.check(window, cx);
-        }
-        cx.notify();
-    }
-
     pub fn set_allow_beta(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.config.allow_beta = on;
         if !on {
@@ -333,23 +301,16 @@ impl Wowzers {
     fn channel_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_config();
         self.statuses.clear();
-        if self.config.effective_api_key().is_some() {
-            self.check(window, cx);
-        }
+        self.check(window, cx);
         cx.notify();
     }
 
-    fn client(&self) -> Result<Client, wowzers_core::Error> {
-        let key = self.config.effective_api_key().unwrap_or_default();
-        let client = Client::new(&key)?;
-        Ok(match &self.options.api_base {
+    fn client(&self) -> Client {
+        let client = Client::new();
+        match &self.options.base_url {
             Some(url) => client.with_base_url(url),
             None => client,
-        })
-    }
-
-    pub fn has_api_key(&self) -> bool {
-        self.config.effective_api_key().is_some()
+        }
     }
 
     // ---- scanning and checking ---------------------------------------
@@ -382,7 +343,7 @@ impl Wowzers {
                     Ok(addons) => this.addons = addons,
                     Err(e) => this.error = Some(e.to_string().into()),
                 }
-                if then_check && this.has_api_key() && !this.addons.is_empty() {
+                if then_check && !this.addons.is_empty() {
                     this.check(window, cx);
                 }
                 cx.notify();
@@ -399,15 +360,7 @@ impl Wowzers {
         let Some(flavor) = self.current_flavor().cloned() else {
             return;
         };
-        let client = match self.client() {
-            Ok(client) => client,
-            Err(e) => {
-                self.error = Some(e.to_string().into());
-                self.tab = Tab::Settings;
-                cx.notify();
-                return;
-            }
-        };
+        let client = self.client();
         let addons = self.addons.clone();
         let channel = self.config.channel();
         self.busy = Some(Busy::Checking);
@@ -474,9 +427,10 @@ impl Wowzers {
         if self.busy.is_some() {
             return;
         }
-        let (Some(flavor), Ok(client)) = (self.current_flavor().cloned(), self.client()) else {
+        let Some(flavor) = self.current_flavor().cloned() else {
             return;
         };
+        let client = self.client();
         let channel = self.config.channel();
         self.begin(Busy::Installing(mod_.name.clone()), cx);
         let progress = self.progress.clone();
@@ -501,9 +455,10 @@ impl Wowzers {
         if jobs.is_empty() || self.busy.is_some() {
             return;
         }
-        let (Some(flavor), Ok(client)) = (self.current_flavor().cloned(), self.client()) else {
+        let Some(flavor) = self.current_flavor().cloned() else {
             return;
         };
+        let client = self.client();
         let channel = self.config.channel();
         self.begin(Busy::Installing(label), cx);
         let progress = self.progress.clone();
@@ -628,14 +583,7 @@ impl Wowzers {
         if query.is_empty() || matches!(self.search_state, SearchState::Searching) {
             return;
         }
-        let client = match self.client() {
-            Ok(client) => client,
-            Err(e) => {
-                self.search_state = SearchState::Failed(e.to_string());
-                cx.notify();
-                return;
-            }
-        };
+        let client = self.client();
         self.search_state = SearchState::Searching;
         cx.notify();
         let task = cx.spawn_in(window, async move |this, cx| {

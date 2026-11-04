@@ -1,4 +1,4 @@
-//! An in-process fake of the CurseForge API plus fixtures, for tests in this
+//! An in-process fake of the CurseForge site plus fixtures, for tests in this
 //! crate and in the UI (enable the `testing` feature).
 
 use std::{
@@ -10,7 +10,6 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use sha1::{Digest, Sha1};
 
 use crate::detect::{FlavorInstall, inspect_root};
 
@@ -24,41 +23,97 @@ pub fn zip_bytes(entries: &[(&str, &str)]) -> Vec<u8> {
     w.finish().unwrap().into_inner()
 }
 
-pub fn sha1_hex(bytes: &[u8]) -> String {
-    Sha1::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// A file the fake project offers.
+#[derive(Debug, Clone)]
+pub struct FakeFile {
+    pub id: u32,
+    pub display: String,
+    pub release_type: u8,
+    pub game_versions: Vec<String>,
+    /// Served from the CDN path when present.
+    pub blob: Option<Vec<u8>>,
+}
+
+impl FakeFile {
+    pub fn new(id: u32, display: &str, game_versions: &[&str]) -> FakeFile {
+        FakeFile {
+            id,
+            display: display.into(),
+            release_type: 1,
+            game_versions: game_versions.iter().map(|v| v.to_string()).collect(),
+            blob: None,
+        }
+    }
+
+    pub fn beta(mut self) -> FakeFile {
+        self.release_type = 2;
+        self
+    }
+
+    pub fn with_blob(mut self, blob: Vec<u8>) -> FakeFile {
+        self.blob = Some(blob);
+        self
+    }
+
+    pub fn file_name(&self) -> String {
+        format!("{}.zip", self.display)
+    }
+
+    /// `<id / 1000>/<id % 1000>/<file name>`, under `/files`.
+    pub fn cdn_path(&self) -> String {
+        format!(
+            "/files/{}/{}/{}",
+            self.id / 1000,
+            self.id % 1000,
+            self.file_name()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FakeProject {
+    pub id: u32,
+    pub name: String,
+    pub slug: String,
+    pub summary: String,
+    pub files: Vec<FakeFile>,
+}
+
+impl FakeProject {
+    pub fn new(id: u32, name: &str, files: Vec<FakeFile>) -> FakeProject {
+        FakeProject {
+            id,
+            name: name.into(),
+            slug: name.to_lowercase().replace(' ', "-"),
+            summary: "s".into(),
+            files,
+        }
+    }
+
+    pub fn at_slug(mut self, slug: &str) -> FakeProject {
+        self.slug = slug.into();
+        self
+    }
 }
 
 pub struct Server {
     pub base: String,
-    /// Paths requested, to assert on batching.
+    /// Requests made, to assert on traffic.
     pub log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-/// Starts a server on a free port. `blobs`: url path -> bytes. `mods`/`files`: API payloads by id.
-pub fn serve(
-    mods: Vec<Value>,
-    files: Vec<Value>,
-    blobs: HashMap<String, Vec<u8>>,
-    key: &'static str,
-) -> Server {
+/// Starts a server on a free port. Each project is reachable by slug, by id
+/// redirect, and by its files' CDN paths.
+pub fn serve(projects: Vec<FakeProject>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let base2 = base.clone();
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log2 = log.clone();
+    let base2 = base.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (mods, files, blobs, log, base) = (
-                mods.clone(),
-                files.clone(),
-                blobs.clone(),
-                log2.clone(),
-                base2.clone(),
-            );
-            std::thread::spawn(move || handle(stream, &mods, &files, &blobs, key, &log, &base));
+            let (projects, log, base) = (projects.clone(), log2.clone(), base2.clone());
+            std::thread::spawn(move || handle(stream, &projects, &log, &base));
         }
     });
     Server { base, log }
@@ -66,10 +121,7 @@ pub fn serve(
 
 fn handle(
     mut stream: TcpStream,
-    mods: &[Value],
-    files: &[Value],
-    blobs: &HashMap<String, Vec<u8>>,
-    key: &str,
+    projects: &[FakeProject],
     log: &std::sync::Mutex<Vec<String>>,
     base: &str,
 ) {
@@ -78,8 +130,8 @@ fn handle(
     reader.read_line(&mut request_line).unwrap();
     let mut parts = request_line.split_whitespace();
     let (method, target) = (
-        parts.next().unwrap().to_string(),
-        parts.next().unwrap().to_string(),
+        parts.next().unwrap_or("GET").to_string(),
+        parts.next().unwrap_or("/").to_string(),
     );
     let mut headers = HashMap::new();
     loop {
@@ -98,77 +150,137 @@ fn handle(
         .unwrap_or(0);
     let mut body = vec![0; len];
     reader.read_exact(&mut body).unwrap();
-    let path = target.split('?').next().unwrap().to_string();
+    let (path, query) = target
+        .split_once('?')
+        .map(|(p, q)| (p.to_string(), q.to_string()))
+        .unwrap_or((target.clone(), String::new()));
     log.lock().unwrap().push(format!("{method} {target}"));
 
-    let (status, content_type, payload): (u16, &str, Vec<u8>) = if let Some(blob) = blobs.get(&path)
-    {
-        (200, "application/zip", blob.clone())
-    } else if headers.get("x-api-key").map(String::as_str) != Some(key) {
-        (403, "text/plain", b"forbidden".to_vec())
-    } else {
-        let json_body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let pick = |all: &[Value], ids: &Value| -> Vec<Value> {
-            all.iter()
-                .filter(|v| ids.as_array().is_some_and(|ids| ids.contains(&v["id"])))
-                .cloned()
-                .collect()
-        };
-        let data = match (method.as_str(), path.as_str()) {
-            ("GET", "/v1/mods/search") => {
-                assert!(target.contains("gameId=1"), "{target}");
-                let query = target
-                    .split(['?', '&'])
-                    .find_map(|kv| kv.strip_prefix("searchFilter="))
-                    .unwrap_or("")
-                    .to_lowercase();
-                let hits: Vec<&Value> = mods
-                    .iter()
-                    .filter(|m| {
-                        m["name"]
-                            .as_str()
-                            .is_some_and(|n| n.to_lowercase().contains(&query))
-                    })
-                    .collect();
-                json!({ "data": hits, "pagination": { "index": 0, "pageSize": 50, "resultCount": hits.len(), "totalCount": hits.len() } })
-            }
-            ("POST", "/v1/mods") => json!({ "data": pick(mods, &json_body["modIds"]) }),
-            ("POST", "/v1/mods/files") => json!({ "data": pick(files, &json_body["fileIds"]) }),
-            _ => {
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                );
-                return;
-            }
-        };
-        (
-            200,
-            "application/json",
-            data.to_string().replace("{BASE}", base).into_bytes(),
-        )
+    let param = |name: &str| -> Option<String> {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")).map(str::to_string))
     };
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+
+    let (status, content_type, payload, location): (u16, &str, Vec<u8>, Option<String>) =
+        if path.starts_with("/files/") {
+            match projects
+                .iter()
+                .flat_map(|p| p.files.iter())
+                .find(|f| f.blob.is_some() && f.cdn_path() == path)
+            {
+                Some(file) => (200, "application/zip", file.blob.clone().unwrap(), None),
+                None => (404, "text/plain", b"missing".to_vec(), None),
+            }
+        } else if path == "/wow/search" {
+            let needle = param("search").unwrap_or_default().to_lowercase();
+            let hits: Vec<&FakeProject> = projects
+                .iter()
+                .filter(|p| p.name.to_lowercase().contains(&needle))
+                .collect();
+            let page: usize = param("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+            let page_size: usize = param("pageSize")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(20)
+                .clamp(1, 50);
+            let start = (page.saturating_sub(1)) * page_size;
+            let mut tiles = Vec::new();
+            for project in hits.iter().skip(start).take(page_size) {
+                tiles.push(json!({
+                    "id": project.id,
+                    "name": project.name,
+                    "slug": project.slug,
+                    "summary": project.summary,
+                    "author": {"name": "me"},
+                    "downloadsCount": 1234,
+                    "thumbnails": {"thumbnailUrl256": ""},
+                }));
+            }
+            let payload = format!(
+                "1:\"x\"\n81:{}\n4:\"{} Projects found\"\n",
+                json!({"gameSlug": "wow", "tileProjects": tiles}),
+                hits.len()
+            );
+            (200, "text/x-component", payload.into_bytes(), None)
+        } else if let Some(slug) = path.strip_prefix("/wow/addons/") {
+            match projects.iter().find(|p| p.slug == slug) {
+                Some(project) => (
+                    200,
+                    "text/x-component",
+                    flight_project(project).into_bytes(),
+                    None,
+                ),
+                // The real site answers unknown slugs with an error page.
+                None => (
+                    200,
+                    "text/x-component",
+                    b"1:\"x\"\n2:\"not found\"\n".to_vec(),
+                    None,
+                ),
+            }
+        } else if let Some(id) = path.strip_prefix("/projects/") {
+            match id
+                .parse::<u32>()
+                .ok()
+                .and_then(|id| projects.iter().find(|p| p.id == id))
+            {
+                Some(project) => (
+                    308,
+                    "text/html",
+                    Vec::new(),
+                    Some(format!("{base}/wow/addons/{}", project.slug)),
+                ),
+                None => (404, "text/html", Vec::new(), None),
+            }
+        } else {
+            (404, "text/plain", b"missing".to_vec(), None)
+        };
+
+    let mut response = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n",
         payload.len()
     );
+    if let Some(location) = location {
+        response.push_str(&format!("location: {location}\r\n"));
+    }
+    response.push_str("\r\n");
+    let _ = stream.write_all(response.as_bytes());
     let _ = stream.write_all(&payload);
 }
 
-pub fn mod_json(id: u32, name: &str, indexes: Vec<Value>) -> Value {
-    json!({ "id": id, "name": name, "slug": name.to_lowercase(), "summary": "s", "downloadCount": 1234.0,
-            "authors": [{"name": "me"}], "latestFilesIndexes": indexes })
-}
-
-pub fn index(game_version: &str, file_id: u32, release_type: u8) -> Value {
-    json!({ "gameVersion": game_version, "fileId": file_id, "filename": "f.zip", "releaseType": release_type })
-}
-
-pub fn file_json(id: u32, mod_id: u32, display: &str, blob_path: &str, sha: &str) -> Value {
-    json!({ "id": id, "modId": mod_id, "displayName": display, "fileName": format!("{display}.zip"),
-            "releaseType": 1, "downloadUrl": format!("{{BASE}}{blob_path}"),
-            "hashes": [{"value": sha, "algo": 1}], "gameVersions": ["11.0.2"] })
+/// A project page payload: one row whose props carry the project record.
+fn flight_project(project: &FakeProject) -> String {
+    let files: Vec<Value> = project
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "id": file.id,
+                "fileName": file.file_name(),
+                "displayName": file.display,
+                "releaseType": file.release_type,
+                "gameVersions": file.game_versions,
+            })
+        })
+        .collect();
+    let project = json!({
+        "id": project.id,
+        "gameId": 1,
+        "name": project.name,
+        "slug": project.slug,
+        "summary": project.summary,
+        "downloads": 1234,
+        "author": {"name": "me"},
+        "thumbnails": {"thumbnailUrl256": ""},
+        "latestFiles": [{
+            "gameVersion": {"id": 517, "name": "WoW Retail"},
+            "files": files,
+        }],
+    });
+    format!(
+        "1:\"x\"\n26:[[\"$\",\"div\",null,{}]]\n",
+        json!({"project": project})
+    )
 }
 
 pub fn wow_with_addons(root: &Path, addons: &[(&str, &str)]) -> FlavorInstall {
@@ -187,11 +299,4 @@ pub fn wow_with_addons(root: &Path, addons: &[(&str, &str)]) -> FlavorInstall {
         std::fs::write(dir.join("old.lua"), "old").unwrap();
     }
     flavor
-}
-
-pub fn blobs(entries: &[(&str, &[u8])]) -> HashMap<String, Vec<u8>> {
-    entries
-        .iter()
-        .map(|(p, b)| (p.to_string(), b.to_vec()))
-        .collect()
 }

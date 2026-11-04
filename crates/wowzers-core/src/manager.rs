@@ -32,8 +32,6 @@ pub enum UpdateStatus {
     Outdated(Box<Candidate>),
     /// CurseForge has no file for this client version and release channel.
     NoCompatibleFile,
-    /// The author forbids downloads through the API.
-    NotDownloadable,
     /// CurseForge doesn't know the project id.
     NotFound,
 }
@@ -57,7 +55,8 @@ pub fn version_matches(toc_version: Option<&str>, file: &File) -> bool {
 }
 
 /// Compares every addon that has a CurseForge project id against the newest
-/// suitable file. Two requests total, however many addons.
+/// suitable file. One project page per addon; the manifest's slug saves the
+/// redirect lookup for addons wowzers installed.
 pub fn check_updates(
     client: &Client,
     flavor: &FlavorInstall,
@@ -75,16 +74,21 @@ pub fn check_updates(
     }
     let mut ids: Vec<u32> = subjects.keys().copied().collect();
     ids.sort_unstable();
+    let slugs: HashMap<u32, String> = subjects
+        .iter()
+        .filter_map(|(id, addon)| {
+            let slug = &addon.tracked.as_ref()?.slug;
+            (!slug.is_empty()).then(|| (*id, slug.clone()))
+        })
+        .collect();
     let mods: HashMap<u32, Mod> = client
-        .get_mods(&ids)?
+        .get_mods(&ids, &slugs)?
         .into_iter()
         .map(|m| (m.id, m))
         .collect();
 
     let target = flavor.target();
     let mut statuses: HashMap<u32, UpdateStatus> = HashMap::new();
-    // project id -> (file id to fetch)
-    let mut to_fetch: HashMap<u32, u32> = HashMap::new();
     for &id in &ids {
         let Some(mod_) = mods.get(&id) else {
             statuses.insert(id, UpdateStatus::NotFound);
@@ -94,46 +98,21 @@ pub fn check_updates(
             statuses.insert(id, UpdateStatus::NoCompatibleFile);
             continue;
         };
-        match subjects[&id].tracked.as_ref() {
+        let subject = subjects[&id];
+        let status = match subject.tracked.as_ref() {
             // File ids grow with upload time; an equal or newer one is current.
-            Some(t) if t.file_id >= best.file_id => {
-                statuses.insert(id, UpdateStatus::UpToDate);
-            }
-            _ => {
-                to_fetch.insert(id, best.file_id);
-            }
-        }
-    }
-
-    let mut file_ids: Vec<u32> = to_fetch.values().copied().collect();
-    file_ids.sort_unstable();
-    file_ids.dedup();
-    let files: HashMap<u32, File> = client
-        .get_files(&file_ids)?
-        .into_iter()
-        .map(|f| (f.id, f))
-        .collect();
-    for (id, file_id) in to_fetch {
-        let mod_ = &mods[&id];
-        let status = match files.get(&file_id) {
-            None => UpdateStatus::NotFound,
-            Some(file) => {
-                let undownloadable = file.download_url.as_deref().is_none_or(str::is_empty)
-                    && mod_.allow_mod_distribution == Some(false);
-                let subject = subjects[&id];
-                if undownloadable {
-                    UpdateStatus::NotDownloadable
-                } else if subject.tracked.is_none()
-                    && version_matches(subject.version.as_deref(), file)
-                {
-                    UpdateStatus::UpToDate
-                } else {
-                    UpdateStatus::Outdated(Box::new(Candidate {
-                        mod_: mod_.clone(),
-                        file: file.clone(),
-                    }))
-                }
-            }
+            Some(t) if t.file_id >= best.id => UpdateStatus::UpToDate,
+            Some(_) => UpdateStatus::Outdated(Box::new(Candidate {
+                mod_: mod_.clone(),
+                file: best.clone(),
+            })),
+            // CurseForge has no installed-version field; match the TOC version
+            // against the file's name.
+            None if version_matches(subject.version.as_deref(), best) => UpdateStatus::UpToDate,
+            None => UpdateStatus::Outdated(Box::new(Candidate {
+                mod_: mod_.clone(),
+                file: best.clone(),
+            })),
         };
         statuses.insert(id, status);
     }
@@ -147,21 +126,23 @@ pub fn resolve_install(
     mod_: &Mod,
     channel: ReleaseType,
 ) -> Result<Candidate> {
-    let best = mod_.best_file(flavor.target(), channel).ok_or_else(|| {
-        Error::Http(format!(
-            "{} has no file for {}",
-            mod_.name,
-            flavor.flavor.label()
-        ))
-    })?;
-    let file = client
-        .get_files(&[best.file_id])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Decode(format!("file {} not returned", best.file_id)))?;
+    // The search card carries identity only; the project page has the files.
+    let project = client
+        .get_mod(mod_.id, Some(&mod_.slug))?
+        .ok_or_else(|| Error::Http(format!("{} is no longer on CurseForge", mod_.name)))?;
+    let best = project
+        .best_file(flavor.target(), channel)
+        .cloned()
+        .ok_or_else(|| {
+            Error::Http(format!(
+                "{} has no file for {}",
+                project.name,
+                flavor.flavor.label()
+            ))
+        })?;
     Ok(Candidate {
-        mod_: mod_.clone(),
-        file,
+        mod_: project,
+        file: best,
     })
 }
 
@@ -221,10 +202,8 @@ pub fn install_all(
                     let Some(job) = jobs.get(i) else { break };
                     emit(format!("Downloading {}", job.mod_.name));
                     let dest = work.join(format!("{}-{}.zip", job.mod_.id, job.file.id));
-                    let result = client
-                        .download_url(&job.mod_, &job.file)
-                        .and_then(|url| client.download(&url, &job.file, &dest))
-                        .map(|()| dest);
+                    let url = client.download_url(&job.file);
+                    let result = client.download(&url, &job.file, &dest).map(|()| dest);
                     *downloads[i].lock().expect("download slot") = Some(result);
                 }
             });
@@ -288,14 +267,9 @@ mod tests {
     fn file(display: &str, name: &str) -> File {
         File {
             id: 1,
-            mod_id: 1,
             display_name: display.into(),
             file_name: name.into(),
             release_type: ReleaseType::Release,
-            file_date: String::new(),
-            file_length: 0,
-            download_url: None,
-            hashes: vec![],
             game_versions: vec![],
         }
     }
