@@ -1,0 +1,26 @@
+[package]
+name = "wowzers-core"
+description = "World of Warcraft addon management over the CurseForge API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dirs.workspace = true
+sha1 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+zip.workspace = true
+
+[features]
+# In-process fake CurseForge API and fixtures, for tests here and in the UI.
+testing = []
+
+[dev-dependencies]
+tempfile = "3"
+wowzers-core = { path = ".", features = ["testing"] }
