@@ -12,16 +12,17 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      # GPUI on Linux: X11/Wayland windowing, xkbcommon keymaps, fontconfig/freetype
-      # text, Vulkan rendering (loaded at runtime).
+      # Rune on Linux: Wayland and X11 windowing (winit loads libX11 and friends, x11rb
+      # loads libxcb), xkbcommon keymaps, Vulkan rendering (loaded at runtime).
       linuxGuiLibs =
         pkgs: with pkgs; [
-          fontconfig
-          freetype
           libxkbcommon
           vulkan-loader
           wayland
           libx11
+          libxcursor
+          libxi
+          libxrandr
           libxcb
         ];
     in
@@ -39,7 +40,11 @@
                 ./crates
               ];
             };
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # Rune is a git dependency pinned by rev in Cargo.lock.
+              allowBuiltinFetchGit = true;
+            };
             cargoBuildFlags = [
               "-p"
               "wowzers"

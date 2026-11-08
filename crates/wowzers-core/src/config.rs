@@ -10,6 +10,30 @@ use crate::{
     flavor::Flavor,
 };
 
+/// The window's colours: follow the desktop, or force light or dark.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    Auto,
+    /// `day`/`night` are what earlier builds saved.
+    #[serde(alias = "day")]
+    Light,
+    #[serde(alias = "night")]
+    Dark,
+}
+
+impl Appearance {
+    /// Whether the dark theme shows, given the desktop's preference.
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Appearance::Auto => system_dark,
+            Appearance::Light => false,
+            Appearance::Dark => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// WoW roots the user added by hand; detected ones aren't stored.
@@ -24,6 +48,8 @@ pub struct Config {
     pub allow_beta: bool,
     #[serde(default)]
     pub allow_alpha: bool,
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 impl Config {
@@ -83,6 +109,7 @@ mod tests {
             wow_roots: vec!["/games/wow".into()],
             selected_flavor: Some(Flavor::ClassicEra),
             allow_beta: true,
+            appearance: Appearance::Dark,
             ..Config::default()
         };
         config.save(&path).unwrap();
@@ -95,6 +122,14 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn configs_written_before_appearance_follow_the_desktop() {
+        let config: Config = serde_json::from_str(r#"{"wow_roots": []}"#).unwrap();
+        assert_eq!(config.appearance, Appearance::Auto);
+        assert!(config.appearance.is_dark(true));
+        assert!(!config.appearance.is_dark(false));
     }
 
     #[test]

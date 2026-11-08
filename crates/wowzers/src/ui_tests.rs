@@ -1,34 +1,41 @@
-//! The real window against an in-process fake CurseForge and a throwaway
-//! WoW folder, driven through clicks.
+//! The real view against an in-process fake CurseForge and a throwaway WoW
+//! folder, driven through clicks on a headless Rune runtime.
 
-use std::{path::PathBuf, time::Duration};
-
-use gpui_kit::test::{TestAppContextExt as _, TestWindowExt as _};
-use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Entity, TestAppContext, Window, WindowBounds,
-    WindowOptions, px, size,
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
 };
+
+use rune::{Env, Runtime};
 use wowzers_core::{
+    config::{Appearance, Config},
     manager::UpdateStatus,
     testing::{FakeFile, FakeProject, Server, serve, wow_with_addons, zip_bytes},
 };
 
-use crate::app::{Options, SearchState, Tab, Wowzers};
+use crate::{
+    app::{self, Options, SearchState, Tab, Wowzers},
+    render, theme,
+};
 
 const WAIT: Duration = Duration::from_secs(15);
+const FRAME: f64 = 1.0 / 60.0;
 
 struct Harness {
-    window: AnyWindowHandle,
-    view: Entity<Wowzers>,
+    rt: Runtime<Wowzers>,
     addons_dir: PathBuf,
+    config_path: PathBuf,
     _server: Server,
     _tmp: tempfile::TempDir,
 }
 
 impl Harness {
-    async fn start(cx: &mut TestAppContext) -> Self {
-        // Downloads and API calls block background threads; GPUI waits for them.
-        cx.executor().allow_parking();
+    fn start() -> Self {
+        Self::start_with(Env::new(false, 1.0))
+    }
+
+    fn start_with(env: Env) -> Self {
         let alpha = zip_bytes(&[
             (
                 "Alpha/Alpha.toc",
@@ -90,49 +97,64 @@ impl Harness {
         .unwrap();
 
         let options = Options {
-            config_path: Some(config_path),
+            config_path: Some(config_path.clone()),
             base_url: Some(server.base.clone()),
             scan_default_locations: false,
         };
-        let (window, view) = cx.update(|cx| {
-            gpui_kit::init(cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        Default::default(),
-                        size(px(980.), px(720.)),
-                    ))),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| cx.new(|cx| Wowzers::new(options, window, cx)),
-            )
-            .expect("open the test window")
-        });
+        let mut rt = Runtime::new(Wowzers::new(options), render::view, (980.0, 720.0), env);
+        rt.poll = Some(app::poll);
+        app::setup(&mut rt.state, Arc::new(|| {}));
+        rt.frame(0.0);
         Harness {
-            window,
-            view,
+            rt,
             addons_dir: flavor.addons_dir,
+            config_path,
             _server: server,
             _tmp: tmp,
         }
     }
 
-    async fn until(&self, cx: &mut TestAppContext, check: impl Fn(&Wowzers) -> bool) {
-        let view = self.view.clone();
-        cx.wait_for(self.window, WAIT, move |_, cx| check(view.read(cx)))
-            .await;
+    /// Runs frames until `check` holds; worker threads answer in real time.
+    fn until(&mut self, check: impl Fn(&Wowzers) -> bool) {
+        let start = Instant::now();
+        loop {
+            self.rt.frame(FRAME);
+            if check(&self.rt.state) {
+                return;
+            }
+            assert!(start.elapsed() < WAIT, "timed out waiting");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The startup scan and update check are done.
-    async fn checked(&self, cx: &mut TestAppContext) {
-        self.until(cx, |app| app.busy.is_none() && !app.statuses.is_empty())
-            .await;
+    fn checked(&mut self) {
+        self.until(|app| app.busy.is_none() && !app.statuses.is_empty());
     }
 
-    fn update<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
-        cx.update_window(self.window, |_, window, cx| f(window, cx))
-            .expect("the test window is open")
+    /// Presses the element at `key` (a key or key path) once motion has landed.
+    fn click(&mut self, key: &str) {
+        self.rt.settle_all();
+        self.rt.frame(FRAME);
+        let (x, y) = self
+            .rt
+            .find(key)
+            .unwrap_or_else(|| panic!("no element {key:?} on screen"));
+        self.rt.pointer_down(x, y);
+        self.rt.pointer_up(x, y);
+        self.rt.frame(FRAME);
+    }
+
+    /// The window's background colour, as drawn once colours have landed.
+    fn background(&mut self) -> String {
+        self.rt.settle_all();
+        self.rt.frame(FRAME);
+        let window = self
+            .rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("window"));
+        window.expect("the window element").fill.hex()
     }
 
     fn read(&self, path: &str) -> Option<String> {
@@ -140,36 +162,40 @@ impl Harness {
     }
 }
 
-#[gpui_kit::test]
-async fn startup_finds_the_install_and_flags_outdated_addons(cx: &mut TestAppContext) {
-    let app = Harness::start(cx).await;
-    app.checked(cx).await;
-    app.view.read_with(cx, |app, _| {
-        let names: Vec<_> = app.addons.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["Alpha", "Beta", "Local only"]);
-        assert_eq!(app.outdated().len(), 2);
-        assert!(matches!(
-            app.status_of(&app.addons[0]),
-            Some(UpdateStatus::Outdated(_))
-        ));
-        assert!(
-            app.status_of(&app.addons[2]).is_none(),
-            "no project id, nothing to check"
-        );
-    });
+fn light_bg() -> String {
+    theme::kit_for(false).c.bg_base.hex()
 }
 
-#[gpui_kit::test]
-async fn update_all_installs_every_outdated_addon_in_one_click(cx: &mut TestAppContext) {
-    let app = Harness::start(cx).await;
-    app.checked(cx).await;
+fn dark_bg() -> String {
+    theme::kit_for(true).c.bg_base.hex()
+}
+
+#[test]
+fn startup_finds_the_install_and_flags_outdated_addons() {
+    let mut app = Harness::start();
+    app.checked();
+    let state = &app.rt.state;
+    let names: Vec<_> = state.addons.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "Beta", "Local only"]);
+    assert_eq!(state.outdated().len(), 2);
+    assert!(matches!(
+        state.status_of(&state.addons[0]),
+        Some(UpdateStatus::Outdated(_))
+    ));
+    assert!(
+        state.status_of(&state.addons[2]).is_none(),
+        "no project id, nothing to check"
+    );
+}
+
+#[test]
+fn update_all_installs_every_outdated_addon_in_one_click() {
+    let mut app = Harness::start();
+    app.checked();
     assert_eq!(app.read("Alpha/new.lua"), None);
 
-    app.update(cx, |window, cx| window.click("update-all", cx));
-    app.until(cx, |app| {
-        app.busy.is_none() && !app.statuses.is_empty() && app.outdated().is_empty()
-    })
-    .await;
+    app.click("update-all");
+    app.until(|app| app.busy.is_none() && !app.statuses.is_empty() && app.outdated().is_empty());
 
     assert_eq!(app.read("Alpha/new.lua").as_deref(), Some("new"));
     assert_eq!(app.read("Beta/new.lua").as_deref(), Some("new"));
@@ -178,69 +204,111 @@ async fn update_all_installs_every_outdated_addon_in_one_click(cx: &mut TestAppC
         app.read("Local/old.lua").is_some(),
         "other addons are untouched"
     );
-    app.view.read_with(cx, |app, _| {
-        assert!(app.addons.iter().filter(|a| a.tracked.is_some()).count() == 2);
-        assert!(matches!(
-            app.status_of(&app.addons[0]),
-            Some(UpdateStatus::UpToDate)
-        ));
-    });
+    let state = &app.rt.state;
+    assert_eq!(
+        state.addons.iter().filter(|a| a.tracked.is_some()).count(),
+        2
+    );
+    assert!(matches!(
+        state.status_of(&state.addons[0]),
+        Some(UpdateStatus::UpToDate)
+    ));
+    assert!(
+        state.notes.iter().any(|n| n.text == "Installed 2 addons"),
+        "a notification says what happened"
+    );
 }
 
-#[gpui_kit::test]
-async fn find_tab_searches_and_installs(cx: &mut TestAppContext) {
-    let app = Harness::start(cx).await;
-    app.checked(cx).await;
-    app.update(cx, |window, cx| window.click("tab-Find addons", cx));
-    app.until(cx, |app| app.tab == Tab::Find).await;
+#[test]
+fn find_tab_searches_and_installs() {
+    let mut app = Harness::start();
+    app.checked();
+    app.click("tabs/segment1");
+    assert_eq!(app.rt.state.tab, Tab::Find);
 
-    let view = app.view.clone();
-    app.update(cx, |window, cx| {
-        view.update(cx, |app, cx| {
-            app.search_input
-                .update(cx, |input, cx| input.set_value("gamma", window, cx))
-        });
-        window.click("search", cx);
-    });
-    app.until(cx, |app| {
-        matches!(app.search_state, SearchState::Results { .. })
-    })
-    .await;
-    app.view.read_with(cx, |app, _| {
-        assert_eq!(app.search_results.len(), 1);
-        assert_eq!(app.search_results[0].name, "Gamma Search");
-        assert!(!app.is_installed(300));
-    });
+    app.rt.state.search.replace_text("gamma");
+    app.click("search");
+    app.until(|app| matches!(app.search_state, SearchState::Results { .. }));
+    assert_eq!(app.rt.state.search_results.len(), 1);
+    assert_eq!(app.rt.state.search_results[0].name, "Gamma Search");
+    assert!(!app.rt.state.is_installed(300));
 
-    app.update(cx, |window, cx| window.click(("install", 0usize), cx));
-    app.until(cx, |app| app.busy.is_none() && app.is_installed(300))
-        .await;
+    app.click("result-300/install");
+    app.until(|app| app.busy.is_none() && app.is_installed(300));
     assert_eq!(app.read("Gamma/new.lua").as_deref(), Some("new"));
-    app.view.read_with(cx, |app, _| {
-        let installed = app
-            .addons
-            .iter()
-            .find(|a| a.project_id == Some(300))
-            .unwrap();
-        assert_eq!(installed.tracked.as_ref().unwrap().file_id, 3002);
-    });
+    let installed = app
+        .rt
+        .state
+        .addons
+        .iter()
+        .find(|a| a.project_id == Some(300))
+        .unwrap();
+    assert_eq!(installed.tracked.as_ref().unwrap().file_id, 3002);
 }
 
-#[gpui_kit::test]
-async fn remove_needs_a_second_click(cx: &mut TestAppContext) {
-    let app = Harness::start(cx).await;
-    app.checked(cx).await;
+#[test]
+fn remove_needs_a_second_click() {
+    let mut app = Harness::start();
+    app.checked();
     let local = app.addons_dir.join("Local");
     assert!(local.exists());
 
-    app.update(cx, |window, cx| window.click(("remove", 2usize), cx));
-    app.until(cx, |app| app.confirm_remove.as_deref() == Some("Local"))
-        .await;
+    app.click("addon-Local/remove");
+    assert_eq!(app.rt.state.confirm_remove.as_deref(), Some("Local"));
     assert!(local.exists(), "the first click only arms the button");
 
-    app.update(cx, |window, cx| window.click(("remove", 2usize), cx));
-    app.until(cx, |app| app.busy.is_none() && app.addons.len() == 2)
-        .await;
+    app.click("addon-Local/remove");
+    app.until(|app| app.busy.is_none() && app.addons.len() == 2);
     assert!(!local.exists());
     assert!(app.addons_dir.join("Alpha").exists());
+}
+
+#[test]
+fn notifications_leave_on_their_own() {
+    let mut app = Harness::start();
+    app.checked();
+    app.click("addon-Local/remove");
+    app.click("addon-Local/remove");
+    app.until(|app| !app.notes.is_empty());
+    assert!(app.rt.find("toast-region").is_some());
+
+    // The app clock is virtual here: ten seconds of frames, no waiting.
+    for _ in 0..600 {
+        app.rt.frame(FRAME);
+    }
+    assert!(app.rt.state.notes.is_empty());
+}
+
+#[test]
+fn theme_follows_the_desktop_until_the_toggle_picks_one() {
+    let mut app = Harness::start_with(Env::new(true, 1.0));
+    assert_eq!(app.rt.state.config.appearance, Appearance::Auto);
+    assert_eq!(
+        app.background(),
+        dark_bg(),
+        "Auto on a dark desktop is dark"
+    );
+
+    app.click("theme-toggle");
+    assert_eq!(app.rt.state.config.appearance, Appearance::Light);
+    assert_eq!(app.background(), light_bg());
+    let saved = Config::load(&app.config_path).unwrap();
+    assert_eq!(saved.appearance, Appearance::Light, "the choice is saved");
+
+    app.rt.set_system_dark(false);
+    app.click("theme-toggle");
+    assert_eq!(
+        app.background(),
+        dark_bg(),
+        "a forced theme ignores the desktop"
+    );
+
+    app.click("tabs/segment2");
+    app.click("appearance/segment0");
+    assert_eq!(app.rt.state.config.appearance, Appearance::Auto);
+    assert_eq!(
+        app.background(),
+        light_bg(),
+        "Auto follows the light desktop again"
+    );
 }

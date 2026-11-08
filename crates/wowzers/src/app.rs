@@ -1,24 +1,20 @@
-//! Application state and the commands that change it. Rendering is in
-//! `render.rs`; everything slow runs on a background thread.
+//! Application state and the commands that change it. Views are in
+//! `render.rs`; everything slow runs on a worker thread and lands in `poll`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    },
     time::Duration,
 };
 
-use gpui_kit::component::{
-    WindowExt as _,
-    input::{InputEvent, InputState},
-    notification::{Notification, NotificationType},
-};
-use gpui_kit::{
-    AppContext as _, Context, Entity, PathPromptOptions, SharedString, Subscription, Task, Window,
-};
+use rune::{FileDialogOptions, TextEdit, Tx, Waker, tok::motion};
 use wowzers_core::{
-    config::Config,
-    curseforge::{Client, Mod},
+    config::{Appearance, Config},
+    curseforge::{Client, Mod, Page, ReleaseType},
     detect::{self, FlavorInstall, WowInstall},
     flavor::Flavor,
     installed::{InstalledAddon, list_installed},
@@ -27,6 +23,10 @@ use wowzers_core::{
 
 /// Overrides the CurseForge server, for testing against a fake.
 const BASE_URL_ENV: &str = "WOWZERS_CURSEFORGE_URL";
+
+/// How long a notification stays up, in seconds.
+const NOTE_SECONDS: f64 = 5.0;
+const ERROR_NOTE_SECONDS: f64 = 9.0;
 
 /// Where the app reads its settings and which servers and folders it uses.
 pub struct Options {
@@ -70,6 +70,21 @@ pub enum SearchState {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    Success,
+    Error,
+}
+
+/// A notification in the corner, gone at `until` (app clock seconds).
+#[derive(Debug, Clone)]
+pub struct Note {
+    pub id: u64,
+    pub kind: NoteKind,
+    pub text: String,
+    until: f64,
+}
+
 pub struct Wowzers {
     pub config: Config,
     options: Options,
@@ -81,52 +96,110 @@ pub struct Wowzers {
     pub statuses: HashMap<u32, UpdateStatus>,
     pub tab: Tab,
     pub busy: Option<Busy>,
-    pub progress: Arc<Mutex<Option<Progress>>>,
-    pub search_input: Entity<InputState>,
+    pub progress: Option<Progress>,
+    pub search: TextEdit,
     pub search_results: Vec<Mod>,
     pub search_state: SearchState,
-    pub path_input: Entity<InputState>,
+    pub path: TextEdit,
     /// Folder name of the addon whose Remove button awaits confirmation.
     pub confirm_remove: Option<String>,
     /// Why the last scan or check failed, shown above the list.
-    pub error: Option<SharedString>,
-    _subscriptions: Vec<Subscription>,
-    _tasks: Vec<Task<()>>,
+    pub error: Option<String>,
+    pub notes: Vec<Note>,
+    next_note: u64,
+    /// The app clock at the last `poll`, for timing notifications.
+    clock: f64,
+    worker: Worker,
+}
+
+/// Work finished on the worker thread, applied in `poll`.
+enum Done {
+    Scanned {
+        addons_dir: PathBuf,
+        then_check: bool,
+        result: wowzers_core::Result<Vec<InstalledAddon>>,
+    },
+    Checked {
+        addons_dir: PathBuf,
+        result: wowzers_core::Result<HashMap<u32, UpdateStatus>>,
+    },
+    Progress(Progress),
+    Installed(InstallOutcome),
+    Removed {
+        name: String,
+        result: wowzers_core::Result<Vec<InstalledAddon>>,
+    },
+    Searched {
+        query: String,
+        result: wowzers_core::Result<Page<Mod>>,
+    },
+}
+
+/// Runs jobs on their own threads and wakes the window when one finishes.
+struct Worker {
+    send: Sender<Done>,
+    receive: Receiver<Done>,
+    /// Set by `AppSpec::setup`; until then answers wait for the first frame.
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl Worker {
+    fn new() -> Self {
+        let (send, receive) = channel();
+        Worker {
+            send,
+            receive,
+            waker: Arc::default(),
+        }
+    }
+
+    /// Returns a function that delivers to `poll` from any thread.
+    fn sink(&self) -> impl Fn(Done) + Send + Sync + Clone + 'static {
+        let send = self.send.clone();
+        let waker = self.waker.clone();
+        move |done| {
+            if send.send(done).is_ok() {
+                let wake = waker.lock().expect("waker lock").clone();
+                if let Some(wake) = wake {
+                    wake();
+                }
+            }
+        }
+    }
+
+    fn spawn(&self, job: impl FnOnce() -> Done + Send + 'static) {
+        let deliver = self.sink();
+        std::thread::spawn(move || deliver(job()));
+    }
+}
+
+/// `AppSpec::setup`: background answers wake the window from now on.
+pub fn setup(app: &mut Wowzers, waker: Waker) {
+    *app.worker.waker.lock().expect("waker lock") = Some(waker);
+}
+
+/// `AppSpec::poll`: lands finished work and expires notifications.
+pub fn poll(app: &mut Wowzers, clock: f64, tx: &mut Tx) -> bool {
+    app.clock = clock;
+    let mut changed = false;
+    while let Ok(done) = app.worker.receive.try_recv() {
+        app.apply(done, tx);
+        changed = true;
+    }
+    let before = app.notes.len();
+    app.notes.retain(|n| n.until > clock);
+    changed |= app.notes.len() != before;
+    app.schedule_note_expiry(tx);
+    changed
 }
 
 impl Wowzers {
-    pub fn new(options: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(options: Options) -> Self {
         let (config, config_error) = match options.config_path.as_deref().map(Config::load) {
             Some(Ok(config)) => (config, None),
             Some(Err(e)) => (Config::default(), Some(e.to_string())),
             None => (Config::default(), None),
         };
-
-        let search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search CurseForge addons"));
-        let path_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/World of Warcraft"));
-        let subscriptions = vec![
-            cx.subscribe_in(
-                &search_input,
-                window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        this.search(window, cx);
-                    }
-                },
-            ),
-            cx.subscribe_in(
-                &path_input,
-                window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        this.add_typed_path(window, cx);
-                    }
-                },
-            ),
-        ];
-
         let mut this = Self {
             config,
             options,
@@ -137,17 +210,20 @@ impl Wowzers {
             statuses: HashMap::new(),
             tab: Tab::Installed,
             busy: None,
-            progress: Arc::new(Mutex::new(None)),
-            search_input,
+            progress: None,
+            search: TextEdit::new(""),
             search_results: Vec::new(),
             search_state: SearchState::Idle,
-            path_input,
+            path: TextEdit::new(""),
             confirm_remove: None,
-            error: config_error.map(Into::into),
-            _subscriptions: subscriptions,
-            _tasks: Vec::new(),
+            error: None,
+            notes: Vec::new(),
+            next_note: 0,
+            clock: 0.0,
+            worker: Worker::new(),
         };
-        this.detect(window, cx);
+        this.detect();
+        this.error = config_error;
         this
     }
 
@@ -167,7 +243,7 @@ impl Wowzers {
     }
 
     /// Finds installs (saved paths first, then the usual places) and picks one.
-    fn detect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn detect(&mut self) {
         let mut roots = self.config.wow_roots.clone();
         if self.options.scan_default_locations {
             roots.extend(detect::candidate_roots());
@@ -196,10 +272,10 @@ impl Wowzers {
         if self.selected_root.is_none() {
             self.tab = Tab::Settings;
         }
-        self.reload(true, window, cx);
+        self.reload(true);
     }
 
-    pub fn select_install(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_install(&mut self, root: PathBuf) {
         let Some(install) = self.installs.iter().find(|i| i.root == root) else {
             return;
         };
@@ -211,26 +287,26 @@ impl Wowzers {
             .map(|f| f.flavor);
         self.selected_root = Some(root);
         self.selected_flavor = flavor;
-        self.selection_changed(window, cx);
+        self.selection_changed();
     }
 
-    pub fn select_flavor(&mut self, flavor: Flavor, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_flavor(&mut self, flavor: Flavor) {
         if self.selected_flavor == Some(flavor) || self.busy.is_some() {
             return;
         }
         self.selected_flavor = Some(flavor);
-        self.selection_changed(window, cx);
+        self.selection_changed();
     }
 
-    fn selection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn selection_changed(&mut self) {
         self.config.selected_root = self.selected_root.clone();
         self.config.selected_flavor = self.selected_flavor;
         self.save_config();
-        self.reload(true, window, cx);
+        self.reload(true);
     }
 
     /// Adds a WoW folder the user picked or typed.
-    fn add_root(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_root(&mut self, path: PathBuf, tx: &mut Tx) {
         match detect::resolve_user_path(&path) {
             Ok(install) => {
                 let root = install.root.clone();
@@ -240,36 +316,31 @@ impl Wowzers {
                 if !self.installs.iter().any(|i| i.root == root) {
                     self.installs.push(install);
                 }
+                self.path.clear();
                 self.tab = Tab::Installed;
-                self.select_install(root, window, cx);
+                self.select_install(root);
             }
-            Err(e) => self.notify(NotificationType::Error, e.to_string(), window, cx),
+            Err(e) => self.note(NoteKind::Error, e.to_string(), tx),
         }
     }
 
-    pub fn add_typed_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.path_input.read(cx).value().trim().to_string();
+    pub fn add_typed_path(&mut self, tx: &mut Tx) {
+        let text = self.path.text.trim().to_string();
         if !text.is_empty() {
-            self.add_root(PathBuf::from(text), window, cx);
+            self.add_root(PathBuf::from(text), tx);
         }
     }
 
-    pub fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Select your World of Warcraft folder".into()),
+    pub fn browse(&mut self, tx: &mut Tx) {
+        let options = FileDialogOptions {
+            title: "Select your World of Warcraft folder".into(),
+            ..Default::default()
+        };
+        tx.open_folder(options, |this: &mut Wowzers, result, tx| match result {
+            Ok(Some(path)) => this.add_root(path, tx),
+            Ok(None) => {}
+            Err(e) => this.note(NoteKind::Error, e.to_string(), tx),
         });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else {
-                return;
-            };
-            if let Some(path) = paths.into_iter().next() {
-                let _ = this.update_in(cx, |this, window, cx| this.add_root(path, window, cx));
-            }
-        })
-        .detach();
     }
 
     // ---- settings -----------------------------------------------------
@@ -282,27 +353,36 @@ impl Wowzers {
         }
     }
 
-    pub fn set_allow_beta(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_allow_beta(&mut self, on: bool) {
         self.config.allow_beta = on;
         if !on {
             self.config.allow_alpha = false;
         }
-        self.channel_changed(window, cx);
+        self.channel_changed();
     }
 
-    pub fn set_allow_alpha(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_allow_alpha(&mut self, on: bool) {
         self.config.allow_alpha = on;
         if on {
             self.config.allow_beta = true;
         }
-        self.channel_changed(window, cx);
+        self.channel_changed();
     }
 
-    fn channel_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn channel_changed(&mut self) {
         self.save_config();
         self.statuses.clear();
-        self.check(window, cx);
-        cx.notify();
+        self.check();
+    }
+
+    /// Light, dark, or follow the desktop; the colours cross-fade.
+    pub fn set_appearance(&mut self, appearance: Appearance, tx: &mut Tx) {
+        if self.config.appearance == appearance {
+            return;
+        }
+        self.config.appearance = appearance;
+        self.save_config();
+        tx.color_motion(motion::CALM);
     }
 
     fn client(&self) -> Client {
@@ -315,45 +395,29 @@ impl Wowzers {
 
     // ---- scanning and checking ---------------------------------------
 
-    /// Re-reads the AddOns folder; with `then_check`, follows with an update
-    /// check when a key is set.
-    pub fn reload(&mut self, then_check: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Re-reads the AddOns folder; with `then_check`, follows with an
+    /// update check.
+    pub fn reload(&mut self, then_check: bool) {
         self.addons.clear();
         self.statuses.clear();
         self.confirm_remove = None;
         self.error = None;
         let Some(flavor) = self.current_flavor().cloned() else {
-            cx.notify();
             return;
         };
         self.busy = Some(Busy::Scanning);
-        cx.notify();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let addons_dir = flavor.addons_dir.clone();
-            let result = cx
-                .background_spawn(async move { list_installed(&addons_dir) })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                // The selection may have moved on while scanning.
-                if this.current_flavor().map(|f| &f.addons_dir) != Some(&flavor.addons_dir) {
-                    return;
-                }
-                this.busy = None;
-                match result {
-                    Ok(addons) => this.addons = addons,
-                    Err(e) => this.error = Some(e.to_string().into()),
-                }
-                if then_check && !this.addons.is_empty() {
-                    this.check(window, cx);
-                }
-                cx.notify();
-            });
+        self.worker.spawn(move || {
+            let result = list_installed(&flavor.addons_dir);
+            Done::Scanned {
+                addons_dir: flavor.addons_dir,
+                then_check,
+                result,
+            }
         });
-        self._tasks.push(task);
     }
 
     /// Asks CurseForge which addons have newer files.
-    pub fn check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn check(&mut self) {
         if matches!(self.busy, Some(Busy::Checking | Busy::Installing(_))) {
             return;
         }
@@ -365,27 +429,13 @@ impl Wowzers {
         let channel = self.config.channel();
         self.busy = Some(Busy::Checking);
         self.error = None;
-        cx.notify();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn({
-                    let flavor = flavor.clone();
-                    async move { manager::check_updates(&client, &flavor, &addons, channel) }
-                })
-                .await;
-            let _ = this.update_in(cx, |this, _, cx| {
-                if this.current_flavor().map(|f| &f.addons_dir) != Some(&flavor.addons_dir) {
-                    return;
-                }
-                this.busy = None;
-                match result {
-                    Ok(statuses) => this.statuses = statuses,
-                    Err(e) => this.error = Some(e.to_string().into()),
-                }
-                cx.notify();
-            });
+        self.worker.spawn(move || {
+            let result = manager::check_updates(&client, &flavor, &addons, channel);
+            Done::Checked {
+                addons_dir: flavor.addons_dir,
+                result,
+            }
         });
-        self._tasks.push(task);
     }
 
     pub fn status_of(&self, addon: &InstalledAddon) -> Option<&UpdateStatus> {
@@ -393,7 +443,7 @@ impl Wowzers {
     }
 
     pub fn outdated(&self) -> Vec<Candidate> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         self.addons
             .iter()
             .filter_map(|a| match self.status_of(a)? {
@@ -406,24 +456,19 @@ impl Wowzers {
     // ---- installing ---------------------------------------------------
 
     /// One click: update every outdated addon.
-    pub fn update_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn update_all(&mut self) {
         let jobs = self.outdated();
         let label = format!("{} addons", jobs.len());
-        self.run_installs(jobs, label, window, cx);
+        self.run_installs(jobs, label);
     }
 
-    pub fn update_one(
-        &mut self,
-        candidate: Candidate,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn update_one(&mut self, candidate: Candidate) {
         let label = candidate.mod_.name.clone();
-        self.run_installs(vec![candidate], label, window, cx);
+        self.run_installs(vec![candidate], label);
     }
 
     /// Installs the newest suitable file of a search result.
-    pub fn install(&mut self, mod_: Mod, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn install(&mut self, mod_: Mod) {
         if self.busy.is_some() {
             return;
         }
@@ -432,26 +477,18 @@ impl Wowzers {
         };
         let client = self.client();
         let channel = self.config.channel();
-        self.begin(Busy::Installing(mod_.name.clone()), cx);
-        let progress = self.progress.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let work = cx.background_spawn(async move {
-                let candidate = manager::resolve_install(&client, &flavor, &mod_, channel)?;
-                run_install(&client, &flavor, vec![candidate], channel, &progress)
-            });
-            let outcome = work.await;
-            let _ = this.update_in(cx, |this, window, cx| this.finished(outcome, window, cx));
+        self.begin(Busy::Installing(mod_.name.clone()));
+        let progress = self.worker.sink();
+        self.worker.spawn(move || {
+            let outcome =
+                manager::resolve_install(&client, &flavor, &mod_, channel).and_then(|candidate| {
+                    run_install(&client, &flavor, vec![candidate], channel, &progress)
+                });
+            Done::Installed(outcome)
         });
-        self._tasks.push(task);
     }
 
-    fn run_installs(
-        &mut self,
-        jobs: Vec<Candidate>,
-        label: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn run_installs(&mut self, jobs: Vec<Candidate>, label: String) {
         if jobs.is_empty() || self.busy.is_some() {
             return;
         }
@@ -460,53 +497,135 @@ impl Wowzers {
         };
         let client = self.client();
         let channel = self.config.channel();
-        self.begin(Busy::Installing(label), cx);
-        let progress = self.progress.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let outcome = cx
-                .background_spawn(
-                    async move { run_install(&client, &flavor, jobs, channel, &progress) },
-                )
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| this.finished(outcome, window, cx));
+        self.begin(Busy::Installing(label));
+        let progress = self.worker.sink();
+        self.worker.spawn(move || {
+            Done::Installed(run_install(&client, &flavor, jobs, channel, &progress))
         });
-        self._tasks.push(task);
     }
 
-    /// Marks the operation started and polls its progress for the UI.
-    fn begin(&mut self, busy: Busy, cx: &mut Context<Self>) {
+    fn begin(&mut self, busy: Busy) {
         self.busy = Some(busy);
         self.error = None;
-        *self.progress.lock().expect("progress lock") = None;
-        cx.notify();
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(120))
-                    .await;
-                let Ok(still_running) = this.update(cx, |this, cx| {
-                    cx.notify();
-                    matches!(this.busy, Some(Busy::Installing(_)))
-                }) else {
-                    break;
-                };
-                if !still_running {
-                    break;
-                }
-            }
-        });
-        self._tasks.push(poll);
+        self.progress = None;
     }
 
-    fn finished(&mut self, outcome: InstallOutcome, window: &mut Window, cx: &mut Context<Self>) {
+    // ---- removing -----------------------------------------------------
+
+    /// First click arms the button; the second deletes.
+    pub fn remove(&mut self, addon: InstalledAddon) {
+        let key = addon.folders.first().cloned().unwrap_or_default();
+        if self.confirm_remove.as_ref() != Some(&key) {
+            self.confirm_remove = Some(key);
+            return;
+        }
+        let Some(flavor) = self.current_flavor().cloned() else {
+            return;
+        };
+        self.confirm_remove = None;
+        self.busy = Some(Busy::Scanning);
+        self.worker.spawn(move || {
+            let addons_dir = flavor.addons_dir;
+            let result =
+                manager::uninstall(&addons_dir, &addon).and_then(|()| list_installed(&addons_dir));
+            Done::Removed {
+                name: addon.name,
+                result,
+            }
+        });
+    }
+
+    // ---- search -------------------------------------------------------
+
+    pub fn search(&mut self) {
+        let query = self.search.text.trim().to_string();
+        if query.is_empty() || matches!(self.search_state, SearchState::Searching) {
+            return;
+        }
+        let client = self.client();
+        self.search_state = SearchState::Searching;
+        self.worker.spawn(move || {
+            let result = client.search(&query, 0, 30);
+            Done::Searched { query, result }
+        });
+    }
+
+    // ---- results ------------------------------------------------------
+
+    fn apply(&mut self, done: Done, tx: &mut Tx) {
+        match done {
+            Done::Scanned {
+                addons_dir,
+                then_check,
+                result,
+            } => {
+                // The selection may have moved on while scanning.
+                if !self.is_current(&addons_dir) {
+                    return;
+                }
+                self.busy = None;
+                // A fresh list lands whole rather than every row fading in.
+                tx.instant();
+                match result {
+                    Ok(addons) => self.addons = addons,
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+                if then_check && !self.addons.is_empty() {
+                    self.check();
+                }
+            }
+            Done::Checked { addons_dir, result } => {
+                if !self.is_current(&addons_dir) {
+                    return;
+                }
+                self.busy = None;
+                match result {
+                    Ok(statuses) => self.statuses = statuses,
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+            Done::Progress(p) => {
+                if matches!(self.busy, Some(Busy::Installing(_))) {
+                    self.progress = Some(p);
+                }
+            }
+            Done::Installed(outcome) => self.finished(outcome, tx),
+            Done::Removed { name, result } => {
+                self.busy = None;
+                match result {
+                    Ok(addons) => {
+                        self.addons = addons;
+                        self.note(NoteKind::Success, format!("Removed {name}"), tx);
+                    }
+                    Err(e) => self.note(NoteKind::Error, e.to_string(), tx),
+                }
+            }
+            Done::Searched { query, result } => match result {
+                Ok(page) => {
+                    self.search_state = SearchState::Results {
+                        query,
+                        total: page.total,
+                    };
+                    self.search_results = page.items;
+                }
+                Err(e) => self.search_state = SearchState::Failed(e.to_string()),
+            },
+        }
+    }
+
+    fn is_current(&self, addons_dir: &PathBuf) -> bool {
+        self.current_flavor().map(|f| &f.addons_dir) == Some(addons_dir)
+    }
+
+    fn finished(&mut self, outcome: InstallOutcome, tx: &mut Tx) {
         self.busy = None;
+        self.progress = None;
         match outcome {
-            Ok(done) => {
-                let InstallDone {
-                    report,
-                    addons,
-                    statuses,
-                } = done;
+            Ok(InstallDone {
+                report,
+                addons,
+                statuses,
+            }) => {
                 self.addons = addons;
                 self.statuses = statuses;
                 self.confirm_remove = None;
@@ -515,109 +634,42 @@ impl Wowzers {
                         [one] => format!("Installed {one}"),
                         many => format!("Installed {} addons", many.len()),
                     };
-                    self.notify(NotificationType::Success, message, window, cx);
+                    self.note(NoteKind::Success, message, tx);
                 }
                 for (name, reason) in report.failed {
-                    self.notify(
-                        NotificationType::Error,
-                        format!("{name}: {reason}"),
-                        window,
-                        cx,
-                    );
+                    self.note(NoteKind::Error, format!("{name}: {reason}"), tx);
                 }
             }
-            Err(e) => self.notify(NotificationType::Error, e.to_string(), window, cx),
+            Err(e) => self.note(NoteKind::Error, e.to_string(), tx),
         }
-        cx.notify();
     }
 
-    // ---- removing -----------------------------------------------------
+    // ---- notifications ------------------------------------------------
 
-    /// First click arms the button; the second deletes.
-    pub fn remove(&mut self, addon: InstalledAddon, window: &mut Window, cx: &mut Context<Self>) {
-        let key = addon.folders.first().cloned().unwrap_or_default();
-        if self.confirm_remove.as_ref() != Some(&key) {
-            self.confirm_remove = Some(key);
-            cx.notify();
-            return;
-        }
-        let Some(flavor) = self.current_flavor().cloned() else {
-            return;
+    fn note(&mut self, kind: NoteKind, text: String, tx: &mut Tx) {
+        let seconds = match kind {
+            NoteKind::Success => NOTE_SECONDS,
+            NoteKind::Error => ERROR_NOTE_SECONDS,
         };
-        self.confirm_remove = None;
-        self.busy = Some(Busy::Scanning);
-        cx.notify();
-        let name = addon.name.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let addons_dir = flavor.addons_dir.clone();
-            let result = cx
-                .background_spawn(async move {
-                    manager::uninstall(&addons_dir, &addon)?;
-                    list_installed(&addons_dir)
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = None;
-                match result {
-                    Ok(addons) => {
-                        this.addons = addons;
-                        this.notify(
-                            NotificationType::Success,
-                            format!("Removed {name}"),
-                            window,
-                            cx,
-                        );
-                    }
-                    Err(e) => this.notify(NotificationType::Error, e.to_string(), window, cx),
-                }
-                cx.notify();
-            });
+        self.next_note += 1;
+        self.notes.push(Note {
+            id: self.next_note,
+            kind,
+            text,
+            until: self.clock + seconds,
         });
-        self._tasks.push(task);
+        self.schedule_note_expiry(tx);
     }
 
-    // ---- search -------------------------------------------------------
+    pub fn dismiss_note(&mut self, id: u64) {
+        self.notes.retain(|n| n.id != id);
+    }
 
-    pub fn search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.search_input.read(cx).value().trim().to_string();
-        if query.is_empty() || matches!(self.search_state, SearchState::Searching) {
-            return;
+    /// Wakes `poll` when the oldest notification is due to go.
+    fn schedule_note_expiry(&self, tx: &mut Tx) {
+        if let Some(next) = self.notes.iter().map(|n| n.until).min_by(f64::total_cmp) {
+            tx.wake_after(Duration::from_secs_f64((next - self.clock).max(0.0)));
         }
-        let client = self.client();
-        self.search_state = SearchState::Searching;
-        cx.notify();
-        let task = cx.spawn_in(window, async move |this, cx| {
-            let q = query.clone();
-            let result = cx
-                .background_spawn(async move { client.search(&q, 0, 30) })
-                .await;
-            let _ = this.update_in(cx, |this, _, cx| {
-                match result {
-                    Ok(page) => {
-                        this.search_state = SearchState::Results {
-                            query,
-                            total: page.total,
-                        };
-                        this.search_results = page.items;
-                    }
-                    Err(e) => this.search_state = SearchState::Failed(e.to_string()),
-                }
-                cx.notify();
-            });
-        });
-        self._tasks.push(task);
-    }
-
-    // ---- helpers ------------------------------------------------------
-
-    fn notify(
-        &self,
-        kind: NotificationType,
-        message: impl Into<SharedString>,
-        window: &mut Window,
-        cx: &mut gpui_kit::App,
-    ) {
-        window.push_notification(Notification::new().message(message).with_type(kind), cx);
     }
 
     /// Whether `project_id` is already in the AddOns folder.
@@ -632,7 +684,7 @@ struct InstallDone {
     statuses: HashMap<u32, UpdateStatus>,
 }
 
-type InstallOutcome = Result<InstallDone, wowzers_core::Error>;
+type InstallOutcome = wowzers_core::Result<InstallDone>;
 
 /// Installs `jobs`, then re-reads the folder and re-checks so the list shows
 /// what is really on disk.
@@ -640,11 +692,11 @@ fn run_install(
     client: &Client,
     flavor: &FlavorInstall,
     jobs: Vec<Candidate>,
-    channel: wowzers_core::curseforge::ReleaseType,
-    progress: &Mutex<Option<Progress>>,
+    channel: ReleaseType,
+    deliver: &(impl Fn(Done) + Sync),
 ) -> InstallOutcome {
     let report = manager::install_all(client, &flavor.addons_dir, &jobs, &|p| {
-        *progress.lock().expect("progress lock") = Some(p);
+        deliver(Done::Progress(p))
     })?;
     let addons = list_installed(&flavor.addons_dir)?;
     let statuses = manager::check_updates(client, flavor, &addons, channel).unwrap_or_default();

@@ -1,11 +1,13 @@
 # wowzers
 
-A World of Warcraft addon manager written in Rust with [GPUI](https://gpui.rs). It reads the public [CurseForge](https://www.curseforge.com/wow/addons) site — no API key — and does four things:
+A World of Warcraft addon manager written in Rust with [Rune](https://github.com/anomalyco/rune). It reads the public [CurseForge](https://www.curseforge.com/wow/addons) site — no API key — and does four things:
 
 - **Finds your WoW install**: Wine prefixes (plain Wine, Lutris, Faugus, Heroic, Bottles, Proton), `/Applications` on macOS, Program Files on Windows, or any folder you pick.
 - **Lists the addons in each client flavor** (Retail, Classic, Classic Era, WoW Forever, PTR, ...), grouping multi-folder addons.
 - **Installs, removes and searches** CurseForge addons.
 - **Updates everything with one click** (*Update all*).
+
+It has plain light and dark themes. By default it follows your desktop's light or dark setting; the sun/moon button in the header switches to the other theme, and *Settings → Appearance* chooses *Auto*, *Light* or *Dark*. The choice is saved with your other settings.
 
 This is a prototype.
 
@@ -22,7 +24,9 @@ nix develop -c cargo run -p wowzers      # Linux / macOS, with the flake's dev s
 nix run github:jtyuill/wowzers           # or run the packaged build
 ```
 
-Without Nix, install a Rust toolchain plus GPUI's system libraries (on Linux: fontconfig, freetype, libxkbcommon, Vulkan loader, Wayland, X11/xcb) and run `cargo run -p wowzers`.
+Without Nix, install a Rust toolchain plus Rune's system libraries (on Linux: libxkbcommon, Wayland, the Vulkan loader, and X11's libX11, libXcursor, libXi, libXrandr and libxcb) and run `cargo run -p wowzers`.
+
+Rune runs any build headlessly, which is handy for screenshots: `wowzers --snap out.png --scene dark` (scenes: `light`, `dark`, `find`, `settings`), and `--script events.json` drives clicks and typing.
 
 ```sh
 cargo test --workspace
@@ -38,7 +42,7 @@ cargo test --workspace
 | Update check, install, update-all, uninstall | `manager.rs` |
 | Safe zip extraction and rollback | `install.rs` |
 | What wowzers installed | `<AddOns>/.wowzers.json` (`manifest.rs`) |
-| GPUI app | `crates/wowzers` |
+| Rune app (state and worker in `app.rs`, views in `render.rs`, light/dark themes in `theme.rs`) | `crates/wowzers` |
 
 Update checking fetches one project page per addon (six at a time); addons wowzers installed reuse the slug saved in the manifest, so they skip the `/projects/<id>` redirect lookup. Each project's newest file per client flavor comes from the page's `latestFiles`, filtered to the client's game version (read from `.build.info`) and your release channel (stable by default).
 

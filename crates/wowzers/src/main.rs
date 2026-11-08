@@ -3,50 +3,42 @@
 mod app;
 mod format;
 mod render;
+mod theme;
 #[cfg(test)]
 mod ui_tests;
 
-use gpui_kit::{
-    App, AppContext as _, Bounds, WindowBounds, WindowOptions, assets::AllAssets, px, size,
-};
+use rune::{App, AppSpec};
 use tracing_subscriber::EnvFilter;
+use wowzers_core::config::Appearance;
+
+use crate::app::{Options, Tab, Wowzers};
 
 /// Wayland app id / X11 WM_CLASS.
 const APP_ID: &str = "dev.jacobyuill.wowzers";
 
 fn main() {
+    rune::prewarm_gpu();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    rune::set_app_id(APP_ID);
 
-    gpui_kit::application()
-        .with_assets(AllAssets)
-        .run(|cx: &mut App| {
-            gpui_kit::init(cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(980.), px(720.)),
-                    cx,
-                ))),
-                window_min_size: Some(size(px(640.), px(420.))),
-                app_id: Some(APP_ID.into()),
-                ..Default::default()
-            };
-            let opened = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| app::Wowzers::new(app::Options::from_env(), window, cx))
-            });
-            if let Err(e) = opened {
-                tracing::error!("opening the window failed: {e:#}");
-                cx.quit();
-                return;
-            }
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            cx.activate(true);
-        });
+    App::new(AppSpec {
+        min_size: Some((640.0, 420.0)),
+        setup: Some(app::setup),
+        poll: Some(app::poll),
+        scenes: &[
+            ("light", |s| s.config.appearance = Appearance::Light),
+            ("dark", |s| s.config.appearance = Appearance::Dark),
+            ("find", |s| s.tab = Tab::Find),
+            ("settings", |s| s.tab = Tab::Settings),
+        ],
+        ..AppSpec::new(
+            "wowzers",
+            (980.0, 720.0),
+            || Wowzers::new(Options::from_env()),
+            render::view,
+        )
+    })
+    .run();
 }

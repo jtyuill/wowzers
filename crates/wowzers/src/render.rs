@@ -1,594 +1,705 @@
 //! The window's contents.
 
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
-    button::{Button, ButtonGroup, ButtonVariants as _},
-    checkbox::Checkbox,
-    h_flex,
-    input::Input,
-    progress::Progress,
-    spinner::Spinner,
-    tag::Tag,
-    v_flex,
-};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+use rune::{Cx, El, ScrollSpec, Spring, TextStyle, col, el, icon, row, text};
+use rune_kit::{
+    Button, ButtonVariant, Checkbox, IconButton, IconButtonVariant, Kit, SegmentedControl, Spinner,
+    StateColors, TextInput, Toast, ToastRegion, glyphs,
 };
 use wowzers_core::{
-    curseforge::Mod, flavor::Flavor, installed::InstalledAddon, manager::UpdateStatus,
+    config::Appearance, curseforge::Mod, installed::InstalledAddon, manager::UpdateStatus,
 };
 
 use crate::{
-    app::{Busy, SearchState, Tab, Wowzers},
+    app::{Busy, NoteKind, SearchState, Tab, Wowzers},
     format::{compact_count, truncate},
+    theme::{self, DOWNLOAD, MOON, REFRESH, SUN, TRASH},
 };
 
-impl Render for Wowzers {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        v_flex()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.header(cx))
-            .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .px_4()
-                        .py_2()
-                        .bg(theme.danger.opacity(0.15))
-                        .text_color(theme.danger)
-                        .text_sm()
-                        .child(error),
-                )
-            })
-            .child(match self.tab {
-                Tab::Installed => self.installed_tab(cx),
-                Tab::Find => self.find_tab(cx),
-                Tab::Settings => self.settings_tab(cx),
-            })
+const TABS: [(Tab, &str); 3] = [
+    (Tab::Installed, "Installed"),
+    (Tab::Find, "Find addons"),
+    (Tab::Settings, "Settings"),
+];
+
+const APPEARANCES: [(Appearance, &str); 3] = [
+    (Appearance::Auto, "Auto"),
+    (Appearance::Light, "Light"),
+    (Appearance::Dark, "Dark"),
+];
+
+const TITLE: TextStyle = TextStyle::new(17.0, 700.0);
+const HEADING: TextStyle = TextStyle::new(14.0, 600.0);
+
+pub fn view(s: &Wowzers, cx: &mut Cx<Wowzers>) -> El {
+    let dark = s.config.appearance.is_dark(cx.system_dark());
+    let k = theme::kit_for(dark);
+    let mut body = col()
+        .key("window")
+        .w_full()
+        .h_full()
+        .fill(k.c.bg_base)
+        .child(header(s, k, dark))
+        .child(rule(k));
+    if let Some(error) = &s.error {
+        body = body.child(
+            row()
+                .key("error")
+                .w_full()
+                .px(16.0)
+                .py(8.0)
+                .fill(k.c.danger.bg)
+                .child(text(error.clone()).font(k.ty.ui).color(k.c.danger.fg)),
+        );
     }
+    body = body.child(match s.tab {
+        Tab::Installed => installed_tab(s, k),
+        Tab::Find => find_tab(s, k),
+        Tab::Settings => settings_tab(s, k),
+    });
+    rune_kit::root(body, [notes(s, k)])
 }
 
-impl Wowzers {
-    fn header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let selected = self.selected_flavor;
-        let flavors: Vec<Flavor> = self
-            .current_install()
-            .map(|i| i.flavors.iter().map(|f| f.flavor).collect())
-            .unwrap_or_default();
-        let tabs = [
-            (Tab::Installed, "Installed"),
-            (Tab::Find, "Find addons"),
-            (Tab::Settings, "Settings"),
-        ];
-        h_flex()
-            .px_4()
-            .py_3()
-            .gap_4()
-            .items_center()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(div().text_lg().font_semibold().child("wowzers"))
-            .child(
-                ButtonGroup::new("tabs")
-                    .outline()
-                    .small()
-                    .children(tabs.iter().map(|(tab, label)| {
-                        Button::new(SharedString::from(format!("tab-{label}")))
-                            .label(*label)
-                            .selected(self.tab == *tab)
-                    }))
-                    .on_click(cx.listener(move |this, clicked: &Vec<usize>, _, cx| {
-                        if let Some(&ix) = clicked.first() {
-                            this.tab = tabs[ix].0;
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(div().flex_1())
-            .when(!flavors.is_empty(), |this| {
-                let options = flavors.clone();
-                this.child(
-                    ButtonGroup::new("flavors")
-                        .outline()
-                        .small()
-                        .children(flavors.iter().map(|f| {
-                            Button::new(SharedString::from(format!("flavor-{}", f.dir_name())))
-                                .label(f.label())
-                                .selected(selected == Some(*f))
-                        }))
-                        .on_click(cx.listener(move |this, clicked: &Vec<usize>, window, cx| {
-                            if let Some(&ix) = clicked.first() {
-                                this.select_flavor(options[ix], window, cx);
-                            }
-                        })),
-                )
-            })
-            .into_any_element()
-    }
+fn header(s: &Wowzers, k: &Kit, dark: bool) -> El {
+    let tab = TABS.iter().position(|(t, _)| *t == s.tab);
+    let labels = TABS.map(|(_, l)| l);
+    let tabs = SegmentedControl::new(&labels, tab)
+        .label("Sections")
+        .fit()
+        .on_pick(|s: &mut Wowzers, i, _| s.tab = TABS[i].0)
+        .build(k)
+        .key("tabs");
 
-    // ---- installed ----------------------------------------------------
-
-    fn installed_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let Some(flavor) = self.current_flavor() else {
-            return self.no_install(cx);
-        };
-        let outdated = self.outdated().len();
-        let busy = self.busy.clone();
-        let idle = busy.is_none();
-        let checking = busy == Some(Busy::Checking);
-
-        let summary = match (&busy, self.addons.len()) {
-            (Some(Busy::Scanning), _) => "Reading AddOns folder…".to_string(),
-            (_, 0) => "No addons installed".to_string(),
-            (_, n) if outdated > 0 => format!("{n} addons, {outdated} with updates"),
-            (_, n) if self.statuses.is_empty() => format!("{n} addons"),
-            (_, n) => format!("{n} addons, all up to date"),
-        };
-
-        let toolbar = h_flex()
-            .px_4()
-            .py_2()
-            .gap_3()
-            .items_center()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().font_medium().child(summary))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(flavor.addons_dir.display().to_string()),
-                    ),
-            )
-            .child(
-                Button::new("check")
-                    .outline()
-                    .icon(IconName::RefreshCw)
-                    .label("Check for updates")
-                    .loading(checking)
-                    .disabled(!idle)
-                    .on_click(cx.listener(|this, _, window, cx| this.check(window, cx))),
-            )
-            .child(
-                Button::new("update-all")
-                    .primary()
-                    .icon(IconName::ArrowDown)
-                    .label(if outdated > 0 {
-                        format!("Update all ({outdated})")
-                    } else {
-                        "Update all".to_string()
-                    })
-                    .disabled(!idle || outdated == 0)
-                    .on_click(cx.listener(|this, _, window, cx| this.update_all(window, cx))),
-            );
-
-        let rows: Vec<AnyElement> = self
-            .addons
-            .iter()
-            .enumerate()
-            .map(|(ix, addon)| self.addon_row(ix, addon, idle, cx))
-            .collect();
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(toolbar)
-            .when_some(self.install_progress(cx), |this, progress| {
-                this.child(progress)
-            })
-            .child(
-                div()
-                    .id("addon-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(v_flex().children(rows)),
-            )
-            .into_any_element()
-    }
-
-    fn install_progress(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(Busy::Installing(label)) = &self.busy else {
-            return None;
-        };
-        let theme = cx.theme().clone();
-        let progress = self.progress.lock().expect("progress lock").clone();
-        let (text, percent) = match progress {
-            Some(p) => (
-                format!("{} ({}/{})", p.message, p.done, p.total),
-                (p.done as f32 / p.total.max(1) as f32) * 100.0,
-            ),
-            None => (format!("Preparing {label}…"), 0.0),
-        };
-        Some(
-            v_flex()
-                .px_4()
-                .py_2()
-                .gap_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(div().text_sm().child(text))
-                .child(Progress::new("install-progress").value(percent))
-                .into_any_element(),
+    let mut bar = row()
+        .key("header")
+        .w_full()
+        .h(52.0)
+        .px(16.0)
+        .gap(16.0)
+        .center_y()
+        .fill(k.c.layer_01)
+        .child(
+            text("wowzers")
+                .key("title")
+                .font(TITLE)
+                .color(k.c.text_accent),
         )
+        .child(tabs)
+        .child(el().grow(1.0));
+
+    let flavors: Vec<_> = s
+        .current_install()
+        .map(|i| i.flavors.iter().map(|f| f.flavor).collect())
+        .unwrap_or_default();
+    if !flavors.is_empty() {
+        let labels: Vec<&str> = flavors.iter().map(|f| f.label()).collect();
+        let selected = flavors.iter().position(|f| Some(*f) == s.selected_flavor);
+        bar = bar.child(
+            SegmentedControl::new(&labels, selected)
+                .label("Game client")
+                .fit()
+                .on_pick(move |s: &mut Wowzers, i, _| s.select_flavor(flavors[i]))
+                .build(k)
+                .key("flavors"),
+        );
     }
 
-    fn addon_row(
-        &self,
-        ix: usize,
-        addon: &InstalledAddon,
-        idle: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme().clone();
-        let status = self.status_of(addon);
-        let details: Vec<String> = [
-            addon.version.as_ref().map(|v| format!("v{v}")),
-            (addon.folders.len() > 1).then(|| format!("{} folders", addon.folders.len())),
-            addon.author.clone().filter(|a| !a.is_empty()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+    // One click flips to the other theme; Settings also offers following the desktop.
+    let (glyph, label, other) = if dark {
+        (&SUN, "Switch to the light theme", Appearance::Light)
+    } else {
+        (&MOON, "Switch to the dark theme", Appearance::Dark)
+    };
+    bar.child(
+        IconButton::new(glyph)
+            .variant(IconButtonVariant::Ghost)
+            .label(label)
+            .help(label)
+            .on_press_tx(move |s: &mut Wowzers, tx| s.set_appearance(other, tx))
+            .build(k)
+            .key("theme-toggle"),
+    )
+}
 
-        let confirming = addon.folders.first() == self.confirm_remove.as_ref();
-        let candidate = match status {
-            Some(UpdateStatus::Outdated(c)) => Some((**c).clone()),
-            _ => None,
-        };
-        let remove_target = addon.clone();
+// ---- installed ------------------------------------------------------------
 
-        h_flex()
-            .id(("addon", ix))
-            .px_4()
-            .py_2()
-            .gap_3()
-            .items_center()
-            .border_b_1()
-            .border_color(theme.border.opacity(0.5))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().font_medium().truncate().child(addon.name.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(details.join("  ·  ")),
-                    ),
-            )
-            .child(self.status_tag(addon, status))
-            .when_some(candidate, |this, candidate| {
-                this.child(
-                    Button::new(("update", ix))
-                        .small()
-                        .primary()
-                        .label("Update")
-                        .disabled(!idle)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.update_one(candidate.clone(), window, cx)
-                        })),
+fn installed_tab(s: &Wowzers, k: &Kit) -> El {
+    let Some(flavor) = s.current_flavor() else {
+        return no_install(k);
+    };
+    let outdated = s.outdated().len();
+    let idle = s.busy.is_none();
+    let checking = s.busy == Some(Busy::Checking);
+
+    let summary = match (&s.busy, s.addons.len()) {
+        (Some(Busy::Scanning), _) => "Reading AddOns folder…".to_string(),
+        (_, 0) => "No addons installed".to_string(),
+        (_, n) if outdated > 0 => format!("{n} addons, {outdated} with updates"),
+        (_, n) if s.statuses.is_empty() => format!("{n} addons"),
+        (_, n) => format!("{n} addons, all up to date"),
+    };
+
+    let toolbar = row()
+        .key("toolbar")
+        .w_full()
+        .px(16.0)
+        .py(10.0)
+        .gap(12.0)
+        .center_y()
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(summary)
+                        .key("summary")
+                        .font(HEADING)
+                        .color(k.c.text_base),
                 )
-            })
-            .child({
-                let button = Button::new(("remove", ix)).small().disabled(!idle);
-                if confirming {
-                    button.danger().label("Confirm remove")
-                } else {
-                    button.ghost().icon(IconName::Delete).tooltip("Remove")
-                }
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.remove(remove_target.clone(), window, cx)
-                }))
-            })
-            .into_any_element()
-    }
-
-    fn status_tag(&self, addon: &InstalledAddon, status: Option<&UpdateStatus>) -> AnyElement {
-        let flavor = self.selected_flavor.map_or("this client", |f| f.label());
-        match (status, addon.project_id) {
-            (Some(UpdateStatus::Outdated(c)), _) => Tag::warning()
-                .small()
-                .child(format!("→ {}", truncate(&c.file.display_name, 32))),
-            (Some(UpdateStatus::UpToDate), _) => Tag::success().small().child("Up to date"),
-            (Some(UpdateStatus::NoCompatibleFile), _) => {
-                Tag::secondary().small().child(format!("No {flavor} file"))
-            }
-            (Some(UpdateStatus::NotFound), _) => {
-                Tag::secondary().small().child("Not on CurseForge")
-            }
-            (None, None) => Tag::secondary().small().child("Not from CurseForge"),
-            (None, Some(_)) if self.busy == Some(Busy::Checking) => {
-                return Spinner::new().xsmall().into_any_element();
-            }
-            (None, Some(_)) => return div().into_any_element(),
-        }
-        .into_any_element()
-    }
-
-    fn no_install(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        v_flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child(
-                div()
-                    .text_lg()
-                    .font_medium()
-                    .child("No World of Warcraft folder found"),
-            )
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child("Pick the folder that contains _retail_ or _classic_."),
-            )
-            .child(
-                Button::new("browse-empty")
-                    .primary()
-                    .icon(IconName::FolderOpen)
-                    .label("Choose folder…")
-                    .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
-            )
-            .into_any_element()
-    }
-
-    // ---- find ---------------------------------------------------------
-
-    fn find_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let searching = matches!(self.search_state, SearchState::Searching);
-        let idle = self.busy.is_none();
-        let status_line = match &self.search_state {
-            SearchState::Idle => "Search by addon name or author.".to_string(),
-            SearchState::Searching => "Searching…".to_string(),
-            SearchState::Results { query, total } => format!("{total} results for “{query}”"),
-            SearchState::Failed(e) => e.clone(),
-        };
-        let installable = self.current_flavor().is_some();
-        let rows: Vec<AnyElement> = self
-            .search_results
-            .iter()
-            .enumerate()
-            .map(|(ix, m)| self.result_row(ix, m, idle && installable, cx))
-            .collect();
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .child(
-                h_flex()
-                    .px_4()
-                    .py_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.search_input)))
-                    .child(
-                        Button::new("search")
-                            .primary()
-                            .icon(IconName::Search)
-                            .label("Search")
-                            .loading(searching)
-                            .on_click(cx.listener(|this, _, window, cx| this.search(window, cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .px_4()
-                    .py_1()
-                    .text_xs()
-                    .text_color(if matches!(self.search_state, SearchState::Failed(_)) {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(status_line),
-            )
-            .when_some(self.install_progress(cx), |this, progress| {
-                this.child(progress)
-            })
-            .child(
-                div()
-                    .id("result-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(v_flex().children(rows)),
-            )
-            .into_any_element()
-    }
-
-    fn result_row(
-        &self,
-        ix: usize,
-        m: &Mod,
-        can_install: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme().clone();
-        let installed = self.is_installed(m.id);
-        let target = m.clone();
-        h_flex()
-            .id(("result", ix))
-            .px_4()
-            .py_2()
-            .gap_3()
-            .items_center()
-            .border_b_1()
-            .border_color(theme.border.opacity(0.5))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_baseline()
-                            .child(div().font_medium().child(m.name.clone()))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(
-                                format!(
-                                    "by {}  ·  {} downloads",
-                                    m.author_names(),
-                                    compact_count(m.download_count)
-                                ),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(truncate(&m.summary, 160)),
-                    ),
-            )
-            .child(if installed {
-                Tag::success().small().child("Installed").into_any_element()
+                .child(
+                    text(flavor.addons_dir.display().to_string())
+                        .key("addons-dir")
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted)
+                        .truncate_head(),
+                ),
+        )
+        .child(
+            Button::new(if checking {
+                "Checking…"
             } else {
-                Button::new(("install", ix))
-                    .small()
-                    .primary()
-                    .icon(IconName::ArrowDown)
-                    .label("Install")
-                    .disabled(!can_install)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.install(target.clone(), window, cx)
-                    }))
-                    .into_any_element()
+                "Check for updates"
             })
-            .into_any_element()
+            .icon(&REFRESH)
+            .disabled(!idle)
+            .on_press(|s: &mut Wowzers| s.check())
+            .build(k)
+            .key("check"),
+        )
+        .child(
+            Button::new(if outdated > 0 {
+                format!("Update all ({outdated})")
+            } else {
+                "Update all".to_string()
+            })
+            .variant(ButtonVariant::Submit)
+            .icon(&DOWNLOAD)
+            .disabled(!idle || outdated == 0)
+            .on_press(|s: &mut Wowzers| s.update_all())
+            .build(k)
+            .key("update-all"),
+        );
+
+    let mut list = col().key("addon-list").px(8.0).py(4.0);
+    for (i, addon) in s.addons.iter().enumerate() {
+        if i > 0 {
+            list = list.child(hairline(k));
+        }
+        list = list.child(addon_row(s, k, addon, idle));
     }
 
-    // ---- settings -----------------------------------------------------
+    let mut tab = col()
+        .key("installed")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(toolbar);
+    if let Some(progress) = install_progress(s, k) {
+        tab = tab.child(progress);
+    }
+    tab.child(rule(k)).child(scroller("addon-scroll", list))
+}
 
-    fn settings_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let heading = |text: &'static str| div().font_semibold().child(text);
-        let hint = |text: String| {
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(text)
-        };
+fn addon_row(s: &Wowzers, k: &Kit, addon: &InstalledAddon, idle: bool) -> El {
+    let status = s.status_of(addon);
+    let details: Vec<String> = [
+        addon.version.as_ref().map(|v| format!("v{v}")),
+        (addon.folders.len() > 1).then(|| format!("{} folders", addon.folders.len())),
+        addon.author.clone().filter(|a| !a.is_empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let folder = addon.folders.first().cloned().unwrap_or_default();
+    let confirming = s.confirm_remove.as_ref() == Some(&folder);
 
-        let installs: Vec<AnyElement> = self
-            .installs
+    let mut r = item_row(format!("addon-{folder}"), k).child(
+        col()
+            .grow(1.0)
+            .min_w(0.0)
+            .child(
+                text(addon.name.clone())
+                    .key("name")
+                    .font(k.ty.ui_medium)
+                    .color(k.c.text_base)
+                    .truncate(),
+            )
+            .child(
+                text(details.join("  ·  "))
+                    .key("details")
+                    .font(k.ty.caption())
+                    .color(k.c.text_muted)
+                    .truncate(),
+            ),
+    );
+    if let Some(tag) = status_tag(s, k, addon, status) {
+        r = r.child(tag);
+    }
+    if let Some(UpdateStatus::Outdated(candidate)) = status {
+        let candidate = (**candidate).clone();
+        r = r.child(
+            Button::new("Update")
+                .variant(ButtonVariant::Submit)
+                .disabled(!idle)
+                .on_press(move |s: &mut Wowzers| s.update_one(candidate.clone()))
+                .build(k)
+                .key("update"),
+        );
+    }
+    let target = addon.clone();
+    let remove = move |s: &mut Wowzers| s.remove(target.clone());
+    r.child(if confirming {
+        Button::new("Confirm remove")
+            .variant(ButtonVariant::Danger)
+            .disabled(!idle)
+            .on_press(remove)
+            .build(k)
+            .key("remove")
+    } else {
+        IconButton::new(&TRASH)
+            .variant(IconButtonVariant::Ghost)
+            .label(format!("Remove {}", addon.name))
+            .help("Remove")
+            .disabled(!idle)
+            .on_press(remove)
+            .build(k)
+            .key("remove")
+    })
+}
+
+fn status_tag(
+    s: &Wowzers,
+    k: &Kit,
+    addon: &InstalledAddon,
+    status: Option<&UpdateStatus>,
+) -> Option<El> {
+    let flavor = s.selected_flavor.map_or("this client", |f| f.label());
+    Some(match (status, addon.project_id) {
+        (Some(UpdateStatus::Outdated(c)), _) => tag(
+            k,
+            format!("→ {}", truncate(&c.file.display_name, 32)),
+            Some(k.c.warning),
+        ),
+        (Some(UpdateStatus::UpToDate), _) => tag(k, "Up to date".into(), Some(k.c.success)),
+        (Some(UpdateStatus::NoCompatibleFile), _) => tag(k, format!("No {flavor} file"), None),
+        (Some(UpdateStatus::NotFound), _) => tag(k, "Not on CurseForge".into(), None),
+        (None, None) => tag(k, "Not from CurseForge".into(), None),
+        (None, Some(_)) if s.busy == Some(Busy::Checking) => {
+            Spinner::new().size(14.0).build(k).key("checking")
+        }
+        (None, Some(_)) => return None,
+    })
+}
+
+fn no_install(k: &Kit) -> El {
+    col()
+        .key("no-install")
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(12.0)
+        .child(
+            text("No World of Warcraft folder found")
+                .font(HEADING)
+                .color(k.c.text_base),
+        )
+        .child(
+            text("Pick the folder that contains _retail_ or _classic_.")
+                .font(k.ty.ui)
+                .color(k.c.text_muted),
+        )
+        .child(
+            Button::new("Choose folder…")
+                .variant(ButtonVariant::Submit)
+                .icon(&glyphs::FOLDER_OPEN)
+                .on_press_tx(|s: &mut Wowzers, tx| s.browse(tx))
+                .build(k)
+                .key("browse-empty"),
+        )
+}
+
+fn install_progress(s: &Wowzers, k: &Kit) -> Option<El> {
+    let Some(Busy::Installing(label)) = &s.busy else {
+        return None;
+    };
+    let (message, fraction) = match &s.progress {
+        Some(p) => (
+            format!("{} ({}/{})", p.message, p.done, p.total),
+            p.done as f32 / p.total.max(1) as f32,
+        ),
+        None => (format!("Preparing {label}…"), 0.0),
+    };
+    Some(
+        col()
+            .key("install-progress")
+            .w_full()
+            .px(16.0)
+            .pb(10.0)
+            .gap(6.0)
+            .child(text(message).font(k.ty.ui).color(k.c.text_muted))
+            .child(
+                el().key("track")
+                    .w_full()
+                    .h(6.0)
+                    .radius(3.0)
+                    .fill(k.c.layer_03)
+                    .child(
+                        el().key("bar")
+                            .w_frac(fraction.clamp(0.0, 1.0))
+                            .h(6.0)
+                            .radius(3.0)
+                            .fill(k.c.bg_accent)
+                            .motion(Spring::new(0.4, 0.0)),
+                    ),
+            ),
+    )
+}
+
+// ---- find -----------------------------------------------------------------
+
+fn find_tab(s: &Wowzers, k: &Kit) -> El {
+    let searching = matches!(s.search_state, SearchState::Searching);
+    let can_install = s.busy.is_none() && s.current_flavor().is_some();
+    let (status_line, failed) = match &s.search_state {
+        SearchState::Idle => ("Search by addon name or author.".to_string(), false),
+        SearchState::Searching => ("Searching…".to_string(), false),
+        SearchState::Results { query, total } => (format!("{total} results for “{query}”"), false),
+        SearchState::Failed(e) => (e.clone(), true),
+    };
+
+    let bar = row()
+        .key("search-bar")
+        .w_full()
+        .px(16.0)
+        .pt(12.0)
+        .gap(8.0)
+        .center_y()
+        .child(
+            el().grow(1.0).min_w(0.0).child(
+                TextInput::new(&s.search)
+                    .placeholder("Search CurseForge addons")
+                    .width(None)
+                    .label("Search")
+                    .leading_icon(&glyphs::SEARCH)
+                    .on_edit(|s: &mut Wowzers| &mut s.search)
+                    .on_submit(|s: &mut Wowzers, _| s.search())
+                    .build(k)
+                    .key("search-input"),
+            ),
+        )
+        .child(
+            Button::new(if searching { "Searching…" } else { "Search" })
+                .variant(ButtonVariant::Submit)
+                .disabled(searching)
+                .on_press(|s: &mut Wowzers| s.search())
+                .build(k)
+                .key("search"),
+        );
+
+    let mut list = col().key("result-list").px(8.0).py(4.0);
+    for (i, m) in s.search_results.iter().enumerate() {
+        if i > 0 {
+            list = list.child(hairline(k));
+        }
+        list = list.child(result_row(s, k, m, can_install));
+    }
+
+    let mut tab = col()
+        .key("find")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(bar)
+        .child(
+            text(status_line)
+                .key("search-status")
+                .px(16.0)
+                .py(8.0)
+                .font(k.ty.caption())
+                .color(if failed {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_muted
+                }),
+        );
+    if let Some(progress) = install_progress(s, k) {
+        tab = tab.child(progress);
+    }
+    tab.child(rule(k)).child(scroller("result-scroll", list))
+}
+
+fn result_row(s: &Wowzers, k: &Kit, m: &Mod, can_install: bool) -> El {
+    let byline = format!(
+        "by {}  ·  {} downloads",
+        m.author_names(),
+        compact_count(m.download_count)
+    );
+    let r = item_row(format!("result-{}", m.id), k).child(
+        col()
+            .grow(1.0)
+            .min_w(0.0)
+            .child(
+                row()
+                    .gap(8.0)
+                    .min_w(0.0)
+                    .child(
+                        text(m.name.clone())
+                            .key("name")
+                            .font(k.ty.ui_medium)
+                            .color(k.c.text_base)
+                            .truncate(),
+                    )
+                    .child(
+                        text(byline)
+                            .key("byline")
+                            .font(k.ty.caption())
+                            .color(k.c.text_muted)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                text(truncate(&m.summary, 160))
+                    .key("summary")
+                    .font(k.ty.ui)
+                    .color(k.c.text_muted)
+                    .truncate(),
+            ),
+    );
+    if s.is_installed(m.id) {
+        return r.child(tag(k, "Installed".into(), Some(k.c.success)));
+    }
+    let target = m.clone();
+    r.child(
+        Button::new("Install")
+            .variant(ButtonVariant::Submit)
+            .icon(&DOWNLOAD)
+            .disabled(!can_install)
+            .on_press(move |s: &mut Wowzers| s.install(target.clone()))
+            .build(k)
+            .key("install"),
+    )
+}
+
+// ---- settings -------------------------------------------------------------
+
+fn settings_tab(s: &Wowzers, k: &Kit) -> El {
+    let appearance = APPEARANCES
+        .iter()
+        .position(|(a, _)| *a == s.config.appearance);
+    let labels = APPEARANCES.map(|(_, l)| l);
+    let theme = section(
+        k,
+        "appearance-section",
+        "Appearance",
+        "Light and dark themes; Auto follows your desktop.",
+    )
+    .child(
+        SegmentedControl::new(&labels, appearance)
+            .label("Appearance")
+            .width(Some(240.0))
+            .on_pick(|s: &mut Wowzers, i, tx| s.set_appearance(APPEARANCES[i].0, tx))
+            .build(k)
+            .key("appearance"),
+    );
+
+    let mut folders = section(
+        k,
+        "folders-section",
+        "World of Warcraft folders",
+        if s.installs.is_empty() {
+            "None found automatically. Choose the folder that contains _retail_ or _classic_."
+        } else {
+            "Found automatically or added by you."
+        },
+    );
+    for install in &s.installs {
+        let root = install.root.clone();
+        let current = s.selected_root.as_ref() == Some(&install.root);
+        let flavors = install
+            .flavors
             .iter()
-            .enumerate()
-            .map(|(ix, install)| {
-                let root = install.root.clone();
-                let current = self.selected_root.as_ref() == Some(&install.root);
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(install.root.display().to_string()),
-                    )
-                    .child(
-                        div().text_xs().text_color(theme.muted_foreground).child(
-                            install
-                                .flavors
-                                .iter()
-                                .map(|f| f.flavor.label())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        ),
-                    )
-                    .child(if current {
-                        Tag::success().small().child("In use").into_any_element()
-                    } else {
-                        Button::new(("use-install", ix))
-                            .small()
-                            .outline()
-                            .label("Use")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_install(root.clone(), window, cx)
-                            }))
-                            .into_any_element()
-                    })
-                    .into_any_element()
-            })
-            .collect();
-
-        v_flex()
-            .id("settings")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_4()
-            .gap_6()
-            .max_w(px(760.))
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(heading("World of Warcraft folders"))
-                    .child(hint(if self.installs.is_empty() {
-                        "None found automatically. Choose the folder that contains _retail_ or _classic_.".into()
-                    } else {
-                        "Found automatically or added by you.".to_string()
-                    }))
-                    .children(installs)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().flex_1().child(Input::new(&self.path_input)))
-                            .child(
-                                Button::new("add-path")
-                                    .outline()
-                                    .label("Add")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_typed_path(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("browse")
-                                    .outline()
-                                    .icon(IconName::FolderOpen)
-                                    .label("Browse…")
-                                    .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(heading("Release channel"))
-                    .child(hint("Stable releases only, unless you opt in.".to_string()))
-                    .child(
-                        Checkbox::new("allow-beta")
-                            .label("Also install beta releases")
-                            .checked(self.config.allow_beta)
-                            .on_click(cx.listener(|this, checked: &bool, window, cx| {
-                                this.set_allow_beta(*checked, window, cx)
-                            })),
-                    )
-                    .child(
-                        Checkbox::new("allow-alpha")
-                            .label("Also install alpha releases")
-                            .checked(self.config.allow_alpha)
-                            .on_click(cx.listener(|this, checked: &bool, window, cx| {
-                                this.set_allow_alpha(*checked, window, cx)
-                            })),
-                    ),
-            )
-            .into_any_element()
+            .map(|f| f.flavor.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key = format!("install-{}", install.root.display());
+        folders = folders.child(
+            row()
+                .key(key)
+                .w_full()
+                .gap(12.0)
+                .center_y()
+                .child(
+                    text(install.root.display().to_string())
+                        .font(k.ty.ui)
+                        .color(k.c.text_base)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate_head(),
+                )
+                .child(text(flavors).font(k.ty.caption()).color(k.c.text_muted))
+                .child(if current {
+                    tag(k, "In use".into(), Some(k.c.success))
+                } else {
+                    Button::new("Use")
+                        .variant(ButtonVariant::Outline)
+                        .on_press(move |s: &mut Wowzers| s.select_install(root.clone()))
+                        .build(k)
+                        .key("use")
+                }),
+        );
     }
+    folders = folders.child(
+        row()
+            .key("add-folder")
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                el().grow(1.0).min_w(0.0).child(
+                    TextInput::new(&s.path)
+                        .placeholder("/path/to/World of Warcraft")
+                        .width(None)
+                        .label("World of Warcraft folder")
+                        .on_edit(|s: &mut Wowzers| &mut s.path)
+                        .on_submit(|s: &mut Wowzers, tx| s.add_typed_path(tx))
+                        .build(k)
+                        .key("path-input"),
+                ),
+            )
+            .child(
+                Button::new("Add")
+                    .variant(ButtonVariant::Outline)
+                    .on_press_tx(|s: &mut Wowzers, tx| s.add_typed_path(tx))
+                    .build(k)
+                    .key("add-path"),
+            )
+            .child(
+                Button::new("Browse…")
+                    .variant(ButtonVariant::Outline)
+                    .icon(&glyphs::FOLDER_OPEN)
+                    .on_press_tx(|s: &mut Wowzers, tx| s.browse(tx))
+                    .build(k)
+                    .key("browse"),
+            ),
+    );
+
+    let channel = section(
+        k,
+        "channel-section",
+        "Release channel",
+        "Stable releases only, unless you opt in.",
+    )
+    .child(
+        Checkbox::new(s.config.allow_beta)
+            .label("Also install beta releases")
+            .on_toggle(|s: &mut Wowzers| s.set_allow_beta(!s.config.allow_beta))
+            .build(k)
+            .key("allow-beta"),
+    )
+    .child(
+        Checkbox::new(s.config.allow_alpha)
+            .label("Also install alpha releases")
+            .on_toggle(|s: &mut Wowzers| s.set_allow_alpha(!s.config.allow_alpha))
+            .build(k)
+            .key("allow-alpha"),
+    );
+
+    let content = col()
+        .key("settings")
+        .w_full()
+        .max_w(760.0)
+        .padding(24.0)
+        .gap(28.0)
+        .child(theme)
+        .child(folders)
+        .child(channel);
+    scroller("settings-scroll", content)
+}
+
+fn section(k: &Kit, key: &str, title: &str, hint: &str) -> El {
+    col()
+        .key(key)
+        .w_full()
+        .gap(8.0)
+        .child(text(title).font(HEADING).color(k.c.text_base))
+        .child(text(hint).font(k.ty.ui).color(k.c.text_muted))
+}
+
+// ---- pieces ---------------------------------------------------------------
+
+/// A vertical scroll viewport filling the rest of the tab.
+fn scroller(key: &str, content: El) -> El {
+    col()
+        .key(key)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(content.w_full())
+}
+
+fn item_row(key: String, k: &Kit) -> El {
+    row()
+        .key(key)
+        .w_full()
+        .px(10.0)
+        .py(8.0)
+        .gap(12.0)
+        .center_y()
+        .radius(k.radius.md)
+        .hover(k.c.hover)
+}
+
+/// A small rounded label; `None` paints it neutral.
+fn tag(k: &Kit, label: String, role: Option<StateColors>) -> El {
+    let (fill, border, ink) = match role {
+        Some(c) => (c.bg, c.border, c.fg),
+        None => (k.c.layer_02, k.c.border_base, k.c.text_muted),
+    };
+    row()
+        .key("tag")
+        .h(22.0)
+        .px(9.0)
+        .radius(11.0)
+        .center_y()
+        .fill(fill)
+        .border(1.0, border)
+        .child(text(label).font(k.ty.small_medium).color(ink))
+}
+
+fn rule(k: &Kit) -> El {
+    el().w_full().h(1.0).fill(k.c.border_base).a11y_hidden()
+}
+
+fn hairline(k: &Kit) -> El {
+    el().h(1.0).mx(10.0).fill(k.c.border_muted).a11y_hidden()
+}
+
+fn notes(s: &Wowzers, k: &Kit) -> El {
+    let mut region = ToastRegion::new();
+    for note in &s.notes {
+        let id = note.id;
+        let (glyph, ink) = match note.kind {
+            NoteKind::Success => (&glyphs::CHECK_SMALL, k.c.success.icon),
+            NoteKind::Error => (&glyphs::CIRCLE_X, k.c.danger.icon),
+        };
+        region = region.toast(
+            Toast::new(format!("note-{id}"), note.text.clone())
+                .lead(icon(glyph, 16.0).color(ink))
+                .on_close(move |s: &mut Wowzers| s.dismiss_note(id))
+                .build(k),
+        );
+    }
+    region.build(k)
 }
