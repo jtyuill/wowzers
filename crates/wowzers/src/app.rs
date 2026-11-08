@@ -62,10 +62,11 @@ pub enum Busy {
     Installing(String),
 }
 
+/// An empty query means the most popular addons.
 #[derive(Debug, Clone)]
 pub enum SearchState {
     Idle,
-    Searching,
+    Searching { query: String },
     Results { query: String, total: u32 },
     Failed(String),
 }
@@ -537,13 +538,25 @@ impl Wowzers {
 
     // ---- search -------------------------------------------------------
 
+    /// Switches tabs; the first visit to Find lists the most popular addons.
+    pub fn open_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        if tab == Tab::Find && matches!(self.search_state, SearchState::Idle) {
+            self.search();
+        }
+    }
+
+    /// Searches for the box's text; an empty box lists the most popular addons.
+    /// A new query supersedes one still in flight.
     pub fn search(&mut self) {
         let query = self.search.text.trim().to_string();
-        if query.is_empty() || matches!(self.search_state, SearchState::Searching) {
+        if matches!(&self.search_state, SearchState::Searching { query: q } if *q == query) {
             return;
         }
         let client = self.client();
-        self.search_state = SearchState::Searching;
+        self.search_state = SearchState::Searching {
+            query: query.clone(),
+        };
         self.worker.spawn(move || {
             let result = client.search(&query, 0, 30);
             Done::Searched { query, result }
@@ -600,16 +613,23 @@ impl Wowzers {
                     Err(e) => self.note(NoteKind::Error, e.to_string(), tx),
                 }
             }
-            Done::Searched { query, result } => match result {
-                Ok(page) => {
-                    self.search_state = SearchState::Results {
-                        query,
-                        total: page.total,
-                    };
-                    self.search_results = page.items;
+            Done::Searched { query, result } => {
+                // Only the newest query's answer counts.
+                if !matches!(&self.search_state, SearchState::Searching { query: q } if *q == query)
+                {
+                    return;
                 }
-                Err(e) => self.search_state = SearchState::Failed(e.to_string()),
-            },
+                match result {
+                    Ok(page) => {
+                        self.search_state = SearchState::Results {
+                            query,
+                            total: page.total,
+                        };
+                        self.search_results = page.items;
+                    }
+                    Err(e) => self.search_state = SearchState::Failed(e.to_string()),
+                }
+            }
         }
     }
 

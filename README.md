@@ -4,7 +4,7 @@ A World of Warcraft addon manager written in Rust with [Rune](https://github.com
 
 - **Finds your WoW install**: Wine prefixes (plain Wine, Lutris, Faugus, Heroic, Bottles, Proton), `/Applications` on macOS, Program Files on Windows, or any folder you pick.
 - **Lists the addons in each client flavor** (Retail, Classic, Classic Era, WoW Forever, PTR, ...), grouping multi-folder addons.
-- **Installs, removes and searches** CurseForge addons.
+- **Installs, removes and searches** CurseForge addons. *Find addons* opens on CurseForge's most popular addons; searching with an empty box brings that list back.
 - **Updates everything with one click** (*Update all*).
 
 It has plain light and dark themes. By default it follows your desktop's light or dark setting; the sun/moon button in the header switches to the other theme, and *Settings → Appearance* chooses *Auto*, *Light* or *Dark*. The choice is saved with your other settings.

@@ -30,7 +30,7 @@ fn main() {
         scenes: &[
             ("light", |s| s.config.appearance = Appearance::Light),
             ("dark", |s| s.config.appearance = Appearance::Dark),
-            ("find", |s| s.tab = Tab::Find),
+            ("find", |s| s.open_tab(Tab::Find)),
             ("settings", |s| s.tab = Tab::Settings),
         ],
         ..AppSpec::new(

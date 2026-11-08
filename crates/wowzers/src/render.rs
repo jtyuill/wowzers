@@ -65,7 +65,7 @@ fn header(s: &Wowzers, k: &Kit, dark: bool) -> El {
     let tabs = SegmentedControl::new(&labels, tab)
         .label("Sections")
         .fit()
-        .on_pick(|s: &mut Wowzers, i, _| s.tab = TABS[i].0)
+        .on_pick(|s: &mut Wowzers, i, _| s.open_tab(TABS[i].0))
         .build(k)
         .key("tabs");
 
@@ -367,11 +367,20 @@ fn install_progress(s: &Wowzers, k: &Kit) -> Option<El> {
 // ---- find -----------------------------------------------------------------
 
 fn find_tab(s: &Wowzers, k: &Kit) -> El {
-    let searching = matches!(s.search_state, SearchState::Searching);
+    // The button only waits on the query that's in the box; editing it allows a new search.
+    let query = s.search.text.trim();
+    let searching =
+        matches!(&s.search_state, SearchState::Searching { query: q } if q == query);
     let can_install = s.busy.is_none() && s.current_flavor().is_some();
     let (status_line, failed) = match &s.search_state {
         SearchState::Idle => ("Search by addon name or author.".to_string(), false),
-        SearchState::Searching => ("Searching…".to_string(), false),
+        SearchState::Searching { query } if query.is_empty() => {
+            ("Loading popular addons…".to_string(), false)
+        }
+        SearchState::Searching { .. } => ("Searching…".to_string(), false),
+        SearchState::Results { query, .. } if query.is_empty() => {
+            ("Most popular addons".to_string(), false)
+        }
         SearchState::Results { query, total } => (format!("{total} results for “{query}”"), false),
         SearchState::Failed(e) => (e.clone(), true),
     };

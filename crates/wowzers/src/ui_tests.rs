@@ -247,6 +247,26 @@ fn find_tab_searches_and_installs() {
 }
 
 #[test]
+fn find_tab_lists_popular_addons_on_first_visit() {
+    let mut app = Harness::start();
+    app.checked();
+    app.click("tabs/segment1");
+    app.until(|app| {
+        matches!(&app.search_state, SearchState::Results { query, .. } if query.is_empty())
+    });
+    let names: Vec<_> = app.rt.state.search_results.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "Beta", "Gamma Search"]);
+
+    app.click("tabs/segment0");
+    app.rt.state.search.replace_text("gamma");
+    app.click("tabs/segment1");
+    assert!(
+        matches!(&app.rt.state.search_state, SearchState::Results { query, .. } if query.is_empty()),
+        "coming back keeps the list instead of searching again"
+    );
+}
+
+#[test]
 fn remove_needs_a_second_click() {
     let mut app = Harness::start();
     app.checked();
